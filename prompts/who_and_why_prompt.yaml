@@ -1,0 +1,59 @@
+prompt: |
+  You are given excerpts from news transcripts. For each entry, determine:
+
+  - Role: The role of the person mentioned. Choose only one from the following:
+    1. Anchor – the person hosting the news show. They are present and speaking in the broadcast.
+    2. Reporter – the person reporting news or being asked to report news. They are present and speaking in the broadcast.
+    3. Guest – a guest who is present and speaking in the broadcast, but whose name is not formally introduced.
+    4. Interviewee – someone who is present and speaking in the broadcast, formally introduced and responding to questions. A person actually speaking typically shows up in the FIRST PERSON ABOUT THEMSELVES – sharing their own experiences, opinions, anecdotes, or ideas ("in our house", "my daughter", "I think we should"). Treat sustained first-person personal content as evidence the person is present and speaking (Interviewee or Guest), not merely talked about.
+    5. Quoted – someone who is NOT present but whose exact words are reproduced verbatim IN QUOTATION MARKS (e.g., "For God's sake, proscribe these people."). If someone is paraphrased or referenced WITHOUT quotation marks (e.g., "he refused to do X"), they are Person of Interest, not Quoted.
+    6. Person of Interest – someone who is NOT present in the broadcast and is only being talked ABOUT (described, referenced, or mentioned in passing). Use this whenever the person does not have an actual exchange or speaking role in the transcript. If in doubt between Interviewee and Person of Interest, ask: **does this person actually deliver a complete thought, answer a question, or speak in their own voice in the text?** If the answer is no — even if their name appears in a cut-off line or seems to be addressed — choose Person of Interest. Incomplete utterances, partial sentences, or mentions do not count as speaking. Conversely, a name that only appears in third-person mentions, cut-off lines, or as an addressee — with no complete first-person utterance of their own — remains Person of Interest.
+
+  - Context_of_mention: How the person is mentioned. Choose only one from the following:
+    1. Introductory – the person is being introduced.
+    2. Quoted – the person is being quoted.
+    3. Informative – the person is being talked about or described.
+
+  Output format:
+  For each entry, return the result including the Group ID exactly as given, so I can map results back.
+  Return your answer as a single JSON object with a "results" key containing a list of objects, following exactly this structure:
+
+  ```json
+  {
+    "results": [
+      {
+        "Group ID": "<characters>",
+        "Person": "<full name>",
+        "Role": "<one of: Anchor, Reporter, Guest, Interviewee, Quoted, Person of Interest>",
+        "Context_of_mention": "<one of: Introductory, Quoted, Informative>"
+      }
+    ]
+  }
+  ```
+
+  Examples:
+  ```json
+  {
+    "results": [
+      {
+        "Group ID": "97af5a26-6646-485b-8592-73b6915ccf17",
+        "Person": "Joe Biden",
+        "Role": "Person of Interest",
+        "Context_of_mention": "Informative"
+      },
+      {
+        "Group ID": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "Person": "Kemi Badenoch",
+        "Role": "Person of Interest",
+        "Context_of_mention": "Informative"
+      }
+    ]
+  }
+  ```
+
+  Why is Kemi Badenoch "Person of Interest" in the second example? Because the text says:
+  "I don't remember you or Kemi Badenoch standing up for Suella Braverman" and
+  "If you let me finish the point about two-tier policing again, Kemi Badenoch..."
+  She is only being talked ABOUT or mentioned; her name appears in a cut-off line, but she does NOT
+  deliver any complete thought or response. She is absent from the actual conversation.
+

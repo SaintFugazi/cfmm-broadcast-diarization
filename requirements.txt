@@ -1,0 +1,15 @@
+# Core data / utilities
+pandas==2.3.1
+pyyaml
+python-dotenv==1.1.1
+colorlog
+tqdm
+
+# LLM (Gemini) agent
+google-genai==1.65.0
+
+# NER (dslim/bert-base-NER) + DeBERTa segment classification
+torch==2.7.1
+transformers==4.54.1
+sentencepiece==0.2.1    # required by the DeBERTa-v3 tokenizer
+protobuf                # required to build the DeBERTa-v3 fast tokenizer
