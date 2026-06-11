@@ -1,7 +1,6 @@
 import os
 import json
 import uuid
-import random
 import asyncio
 
 import torch
@@ -11,10 +10,18 @@ from google import genai
 from google.genai import types
 
 from utils.progress import gather_with_progress
+from utils.rate_limit import (
+    AsyncRateLimiter,
+    async_call_with_retry,
+    validate_response,
+    close_async_client,
+    PIPELINE_SAFETY_SETTINGS,
+    SafetyBlockedError,
+)
 
 from utils.logger import get_logger
 from utils.prompt_loader import load_prompt
-from config.constants import RowStatus
+from config.constants import RowStatus, BlockStatus
 from config.constants import (
     NER_MODEL_NAME,
     NER_BATCH_SIZE,
@@ -25,6 +32,7 @@ from config.constants import (
     NAME_EXTRACTION_BACKOFF_BASE,
     NAME_EXTRACTION_BACKOFF_CAP,
     WHO_AND_WHY_CHUNK_SIZE,
+    GEMINI_RPM_LIMIT,
     GEMINI_INPUT_COST_PER_1M,
     GEMINI_OUTPUT_COST_PER_1M,
 )
@@ -52,6 +60,7 @@ class NameExtractor:
         self.who_why_prompt = prompt["prompt"]
 
         self.semaphore = asyncio.Semaphore(NAME_EXTRACTION_CONCURRENCY)
+        self.limiter = None  # AsyncRateLimiter, created per run inside the event loop
 
         # NER model loaded lazily on first use
         self.device = torch.device(
@@ -67,6 +76,7 @@ class NameExtractor:
         self.processed = 0      # groups marked NAMED
         self.skipped = 0        # groups with empty text / no persons
         self.failed = 0         # groups marked FAILED_N
+        self.blocked = 0        # groups safety-blocked → NAMED w/ NULL role/context
         self.persons_found = 0
 
     # ------------------------------------------------------------------ #
@@ -86,14 +96,15 @@ class NameExtractor:
         entries = self._run_ner(rows)
 
         # Stage 2: who/why for rows that contain person mentions
-        results, failed_groups = {}, set()
+        results, failed_groups, blocked_groups = {}, set(), set()
         if entries:
             chunks = [entries[i:i + WHO_AND_WHY_CHUNK_SIZE]
                       for i in range(0, len(entries), WHO_AND_WHY_CHUNK_SIZE)]
-            results, failed_groups = asyncio.run(self._run_all(chunks))
+            self.limiter = AsyncRateLimiter(GEMINI_RPM_LIMIT)
+            results, failed_groups, blocked_groups = asyncio.run(self._run_all(chunks))
 
         # Stage 3: persist person rows + update grouped statuses
-        self._persist(rows, entries, results, failed_groups)
+        self._persist(rows, entries, results, failed_groups, blocked_groups)
 
         self._log_cost_summary(len(rows))
 
@@ -235,35 +246,74 @@ class NameExtractor:
     # ------------------------------------------------------------------ #
     async def _run_all(self, chunks):
         results = {}            # (group_id, person_lower) -> (role, context)
-        failed_groups = set()   # group_ids whose chunk permanently failed
+        failed_groups = set()   # group_ids whose chunk transiently failed (retryable)
+        blocked_groups = set()  # group_ids whose text the core filter rejected (terminal)
 
         tasks = [asyncio.create_task(self._process_chunk(chunk)) for chunk in chunks]
-        outcomes = await gather_with_progress(tasks, desc="Chunks", unit="chk")
+        try:
+            outcomes = await gather_with_progress(tasks, desc="Chunks", unit="chk")
+        finally:
+            await close_async_client(self.client, logger)
         for chunk, outcome in zip(chunks, outcomes):
             if isinstance(outcome, Exception) or outcome is None:
                 failed_groups.update(e["group_id"] for e in chunk)
                 continue
-            results.update(outcome)
-        return results, failed_groups
+            results.update(outcome["results"])
+            failed_groups.update(outcome["failed"])
+            blocked_groups.update(outcome["blocked"])
+        # A group resolved by any chunk (or terminally blocked) shouldn't also count
+        # as transiently failed.
+        resolved_groups = {group_id for (group_id, _person) in results}
+        failed_groups -= (resolved_groups | blocked_groups)
+        return results, failed_groups, blocked_groups
 
     async def _process_chunk(self, chunk):
         async with self.semaphore:
-            prompt = self._build_chunk_prompt(chunk)
-            try:
-                text, in_tokens, out_tokens = await self._call_llm_with_retry(prompt)
-                self.total_input_tokens += in_tokens
-                self.total_output_tokens += out_tokens
-                return self._parse_response(text)
-            except Exception as e:
-                logger.warning(f"Who/Why chunk failed permanently "
-                               f"({len(chunk)} entries): {e}")
-                return None
+            return await self._classify_entries(chunk, allow_isolation=True)
+
+    async def _classify_entries(self, chunk, allow_isolation: bool):
+        """Resolve role/context for a batch of person-entries in one LLM call.
+
+        Returns {"results": {...}, "failed": set(), "blocked": set()} — or None when the
+        whole batch failed transiently (retryable). On a safety block of a multi-entry
+        batch, re-resolve each entry individually so only the genuinely blocked group(s)
+        are degraded (NAMED with NULL role/context) while the rest get real verdicts.
+        """
+        prompt = self._build_chunk_prompt(chunk)
+        try:
+            text, in_tokens, out_tokens = await self._call_llm_with_retry(prompt)
+            self.total_input_tokens += in_tokens
+            self.total_output_tokens += out_tokens
+            return {"results": self._parse_response(text), "failed": set(), "blocked": set()}
+        except SafetyBlockedError as e:
+            if allow_isolation and len(chunk) > 1:
+                logger.info(f"Who/Why batch safety-blocked ({len(chunk)} entries); "
+                            f"isolating the offending group(s) one entry at a time.")
+                merged = {"results": {}, "failed": set(), "blocked": set()}
+                for entry in chunk:
+                    outcome = await self._classify_entries([entry], allow_isolation=False)
+                    if outcome is None:
+                        merged["failed"].add(entry["group_id"])
+                        continue
+                    merged["results"].update(outcome["results"])
+                    merged["failed"] |= outcome["failed"]
+                    merged["blocked"] |= outcome["blocked"]
+                return merged
+            # Single entry (or already isolated) is the genuine offender.
+            logger.warning(f"Who/Why safety-blocked for group_id={chunk[0]['group_id']}; "
+                           f"keeping name(s) with NULL role/context ({e}).")
+            return {"results": {}, "failed": set(),
+                    "blocked": {e2["group_id"] for e2 in chunk}}
+        except Exception as e:
+            logger.warning(f"Who/Why chunk failed permanently "
+                           f"({len(chunk)} entries): {e}")
+            return None
 
     def _build_chunk_prompt(self, chunk) -> str:
         entries = []
         for idx, e in enumerate(chunk, 1):
             entries.append(
-                f"\n--------\nEntry {idx}\Group ID: {e['group_id']}\n"
+                f"\n--------\nEntry {idx}\nGroup ID: {e['group_id']}\n"
                 f"Person: {e['person']}\nText: {e['plain_text'].strip()}\n"
             )
         return f"{''.join(entries)}\n\n{self.who_why_prompt}"
@@ -278,7 +328,8 @@ class NameExtractor:
             return mapping
 
         for item in data.get("results", []) or []:
-            group_id = item.get("Text ID")
+            # The prompt asks for "Group ID"; accept "Text ID" too for robustness.
+            group_id = item.get("Group ID") or item.get("Text ID")
             person = item.get("Person")
             if not group_id or not person:
                 continue
@@ -286,50 +337,45 @@ class NameExtractor:
                 item.get("Role"),
                 item.get("Context_of_mention"),
             )
+
+        if (data.get("results") or []) and not mapping:
+            logger.warning("Who/Why response contained results but none were usable — "
+                           f"possible output-key mismatch. First item keys: "
+                           f"{list((data['results'][0] or {}).keys())}")
         return mapping
 
     async def _call_llm_with_retry(self, prompt):
-        last_exc = None
-        for attempt in range(NAME_EXTRACTION_MAX_RETRIES):
-            try:
-                resp = await self.client.aio.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        response_mime_type="application/json",
-                    ),
-                )
-                usage = resp.usage_metadata
-                in_tokens = usage.prompt_token_count or 0
-                out_tokens = usage.candidates_token_count or 0
-                return resp.text, in_tokens, out_tokens
-            except Exception as e:
-                last_exc = e
-                sleep_s = min(NAME_EXTRACTION_BACKOFF_BASE ** attempt,
-                              NAME_EXTRACTION_BACKOFF_CAP)
-                sleep_s += random.uniform(0, 1)  # jitter
-                if self._is_rate_limit(e):
-                    logger.info(f"Rate limit hit (attempt {attempt + 1}); "
-                                f"backing off {sleep_s:.1f}s")
-                else:
-                    logger.info(f"Error (attempt {attempt + 1}): {e}; "
-                                f"retrying in {sleep_s:.1f}s")
-                await asyncio.sleep(sleep_s)
+        async def make_call():
+            resp = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                    safety_settings=PIPELINE_SAFETY_SETTINGS,
+                ),
+            )
+            text = validate_response(resp)
+            usage = resp.usage_metadata
+            return text, usage.prompt_token_count or 0, usage.candidates_token_count or 0
 
-        raise last_exc
-
-    @staticmethod
-    def _is_rate_limit(exc) -> bool:
-        msg = str(exc).lower()
-        return "429" in msg or "resource_exhausted" in msg or "rate limit" in msg
+        return await async_call_with_retry(
+            make_call,
+            limiter=self.limiter,
+            logger=logger,
+            backoff_base=NAME_EXTRACTION_BACKOFF_BASE,
+            backoff_cap=NAME_EXTRACTION_BACKOFF_CAP,
+            transient_max_retries=NAME_EXTRACTION_MAX_RETRIES,
+        )
 
     # ------------------------------------------------------------------ #
     # Stage 3: persist
     # ------------------------------------------------------------------ #
-    def _persist(self, rows, entries, results, failed_groups):
+    def _persist(self, rows, entries, results, failed_groups, blocked_groups):
         person_rows = []
         for e in entries:
+            # Blocked groups never received an LLM verdict → keep the BERT-extracted
+            # person but leave role/context NULL.
             role, context = results.get((e["group_id"], e["person"].lower().strip()),
                                         (None, None))
             person_rows.append({
@@ -352,6 +398,13 @@ class NameExtractor:
             if group_id in failed_groups:
                 self.db.update_status("grouped", group_id, RowStatus.FAILED_N)
                 self.failed += 1
+            elif group_id in blocked_groups:
+                # Terminal: names kept (NULL role/context), advance so reruns skip it.
+                self.db.update_status("grouped", group_id, RowStatus.NAMED)
+                self.db.set_block_status("grouped", group_id, BlockStatus.NAMES)
+                self.blocked += 1
+                if group_id not in groups_with_persons:
+                    self.skipped += 1
             else:
                 self.db.update_status("grouped", group_id, RowStatus.NAMED)
                 self.processed += 1
@@ -372,6 +425,7 @@ class NameExtractor:
         logger.info("=" * 60)
         logger.info(f"Rows total:           {total_rows}")
         logger.info(f"  named:              {self.processed}")
+        logger.info(f"  safety-blocked:     {self.blocked} (NULL role/context)")
         logger.info(f"  (no persons):       {self.skipped}")
         logger.info(f"  failed:             {self.failed}")
         logger.info(f"Persons extracted:    {self.persons_found}")

@@ -2,31 +2,37 @@ import os
 import re
 import json
 import uuid
-import random
 import asyncio
 
 from google import genai
 from google.genai import types
 
 from utils.progress import gather_with_progress
+from utils.rate_limit import (
+    AsyncRateLimiter,
+    async_call_with_retry,
+    validate_response,
+    close_async_client,
+    PIPELINE_SAFETY_SETTINGS,
+    SafetyBlockedError,
+)
 
 from utils.logger import get_logger
 from utils.prompt_loader import load_prompt
-from config.constants import RowStatus
+from config.constants import RowStatus, BlockStatus
 from config.constants import (
     DIARIZATION_CONCURRENCY,
     DIARIZATION_MAX_RETRIES,
     DIARIZATION_BACKOFF_BASE,
     DIARIZATION_BACKOFF_CAP,
     DIARIZATION_CACHE_TTL,
+    GEMINI_RPM_LIMIT,
     GEMINI_INPUT_COST_PER_1M,
     GEMINI_OUTPUT_COST_PER_1M,
     GEMINI_CACHE_INPUT_DISCOUNT,
 )
 
 logger = get_logger(__name__)
-
-PROMPT_PATH = "prompts/group_diarization_prompt.yaml"
 
 
 class DiarizationAgent:
@@ -36,7 +42,13 @@ class DiarizationAgent:
     plus the group's person_bio candidate speakers to Gemini, which splits the passage into
     consecutive speaker turns. Each turn is written to the `dialogues` table; groups advance
     to DIARIZED (or FAILED_D on permanent failure).
+
+    Subclasses (e.g. IndexedDiarizationAgent for OVER-sized transcripts) override
+    PROMPT_PATH / STAGE_LABEL, the per-group processing, and _config_kwargs.
     """
+
+    PROMPT_PATH = "prompts/group_diarization_prompt.yaml"
+    STAGE_LABEL = "GROUP DIARIZATION"
 
     def __init__(self, db_manager, df):
         self.db = db_manager
@@ -45,11 +57,12 @@ class DiarizationAgent:
         self.client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
         self.model = os.getenv("GEMINI_MODEL")
 
-        prompt = load_prompt(PROMPT_PATH)
+        prompt = load_prompt(self.PROMPT_PATH)
         self.system_instruction = prompt["system_prompt"]
         self.user_template = prompt["user_prompt"]
 
         self.semaphore = asyncio.Semaphore(DIARIZATION_CONCURRENCY)
+        self.limiter = None  # AsyncRateLimiter, created per run inside the event loop
 
         # Explicit context cache for the (large, fixed) system instruction.
         self.cache_name = None
@@ -60,6 +73,7 @@ class DiarizationAgent:
         self.total_cached_tokens = 0  # input tokens served from cache (billed at a discount)
         self.processed = 0          # groups marked DIARIZED
         self.failed = 0             # groups marked FAILED_D
+        self.blocked = 0            # groups safety-blocked → single UNKNOWN turn
         self.segments_total = 0     # speaker turns written to `dialogues`
 
     # ------------------------------------------------------------------ #
@@ -73,8 +87,9 @@ class DiarizationAgent:
             return
 
         logger.info(f"Starting group diarization on {len(rows)} group(s) "
-                    f"(concurrency={DIARIZATION_CONCURRENCY})")
+                    f"(concurrency={DIARIZATION_CONCURRENCY}, rpm={GEMINI_RPM_LIMIT})")
 
+        self.limiter = AsyncRateLimiter(GEMINI_RPM_LIMIT)
         self._setup_cache()
         try:
             asyncio.run(self._run_all(rows))
@@ -124,7 +139,10 @@ class DiarizationAgent:
     # ------------------------------------------------------------------ #
     async def _run_all(self, rows):
         tasks = [asyncio.create_task(self._process_group(row)) for row in rows]
-        await gather_with_progress(tasks, desc="Groups", unit="grp")
+        try:
+            await gather_with_progress(tasks, desc="Groups", unit="grp")
+        finally:
+            await close_async_client(self.client, logger)
 
     async def _process_group(self, row):
         async with self.semaphore:
@@ -147,10 +165,40 @@ class DiarizationAgent:
 
                 self.db.update_status("grouped", group_id, RowStatus.DIARIZED)
                 self.processed += 1
+            except SafetyBlockedError as e:
+                self._handle_safety_block(row, e)
             except Exception as e:
                 self.failed += 1
                 self.db.update_status("grouped", group_id, RowStatus.FAILED_D)
                 logger.warning(f"Failed to diarize group_id={group_id}: {e}")
+
+    def _handle_safety_block(self, row, exc):
+        """Core filter rejected the transcript: the LLM cannot diarize it. Emit a single
+        UNKNOWN-speaker turn carrying the whole text (confidence 0, block_status set) so
+        the content still reaches the export, then advance to DIARIZED (terminal — reruns
+        skip it, and the block flag keeps it out of verification)."""
+        group_id = row["group_id"]
+        dialogue = (row.get("plain_text") or "").strip()
+        if dialogue:
+            # Deterministic id so a manual rerun of this group doesn't duplicate the row.
+            dialogue_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"blocked-diarize::{group_id}"))
+            self.db.insert_dialogues([{
+                "dialogue_id": dialogue_id,
+                "group_id": group_id,
+                "program_id": row.get("program_id"),
+                "broadcast_time": row.get("broadcast_time"),
+                "dialogue": dialogue,
+                "speaker": "UNKNOWN",
+                "role": None,
+                "confidence_score": 0.0,
+                "block_status": BlockStatus.DIARIZATION,
+            }])
+            self.segments_total += 1
+        self.db.set_block_status("grouped", group_id, BlockStatus.DIARIZATION)
+        self.db.update_status("grouped", group_id, RowStatus.DIARIZED)
+        self.blocked += 1
+        logger.warning(f"Diarization safety-blocked for group_id={group_id}; "
+                       f"wrote single UNKNOWN-speaker turn and continued ({exc}).")
 
     @staticmethod
     def _build_people_data(rows) -> str:
@@ -287,53 +335,44 @@ class DiarizationAgent:
 
         return True  # Every occurrence is a direct address
 
+    def _config_kwargs(self) -> dict:
+        """GenerateContentConfig kwargs; references the cached system instruction when
+        available, otherwise inlines it (cached_content and system_instruction are
+        mutually exclusive). Subclasses extend this (e.g. to add a response_schema)."""
+        kwargs = dict(
+            temperature=0,
+            response_mime_type="application/json",
+            safety_settings=PIPELINE_SAFETY_SETTINGS,
+        )
+        if self.cache_name:
+            kwargs["cached_content"] = self.cache_name
+        else:
+            kwargs["system_instruction"] = self.system_instruction
+        return kwargs
+
     async def _call_llm_with_retry(self, user_prompt):
-        last_exc = None
-        for attempt in range(DIARIZATION_MAX_RETRIES):
-            try:
-                # Reference the cached system instruction when available; otherwise inline it.
-                # (cached_content and system_instruction are mutually exclusive.)
-                if self.cache_name:
-                    config = types.GenerateContentConfig(
-                        cached_content=self.cache_name,
-                        temperature=0,
-                        response_mime_type="application/json",
-                    )
-                else:
-                    config = types.GenerateContentConfig(
-                        system_instruction=self.system_instruction,
-                        temperature=0,
-                        response_mime_type="application/json",
-                    )
+        async def make_call():
+            config = types.GenerateContentConfig(**self._config_kwargs())
 
-                resp = await self.client.aio.models.generate_content(
-                    model=self.model,
-                    contents=user_prompt,
-                    config=config,
-                )
-                usage = resp.usage_metadata
-                in_tokens = usage.prompt_token_count or 0
-                out_tokens = usage.candidates_token_count or 0
-                cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
-                return resp.text, in_tokens, out_tokens, cached_tokens
-            except Exception as e:
-                last_exc = e
-                sleep_s = min(DIARIZATION_BACKOFF_BASE ** attempt, DIARIZATION_BACKOFF_CAP)
-                sleep_s += random.uniform(0, 1)  # jitter
-                if self._is_rate_limit(e):
-                    logger.info(f"Rate limit hit (attempt {attempt + 1}); "
-                                f"backing off {sleep_s:.1f}s")
-                else:
-                    logger.info(f"Error (attempt {attempt + 1}): {e}; "
-                                f"retrying in {sleep_s:.1f}s")
-                await asyncio.sleep(sleep_s)
+            resp = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=user_prompt,
+                config=config,
+            )
+            text = validate_response(resp)
+            usage = resp.usage_metadata
+            cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
+            return (text, usage.prompt_token_count or 0,
+                    usage.candidates_token_count or 0, cached_tokens)
 
-        raise last_exc
-
-    @staticmethod
-    def _is_rate_limit(exc) -> bool:
-        msg = str(exc).lower()
-        return "429" in msg or "resource_exhausted" in msg or "rate limit" in msg
+        return await async_call_with_retry(
+            make_call,
+            limiter=self.limiter,
+            logger=logger,
+            backoff_base=DIARIZATION_BACKOFF_BASE,
+            backoff_cap=DIARIZATION_BACKOFF_CAP,
+            transient_max_retries=DIARIZATION_MAX_RETRIES,
+        )
 
     # ------------------------------------------------------------------ #
     # Reporting
@@ -350,10 +389,11 @@ class DiarizationAgent:
         avg_cost = total_cost / self.processed if self.processed else 0.0
 
         logger.info("=" * 60)
-        logger.info("GROUP DIARIZATION - COST BREAKDOWN")
+        logger.info(f"{self.STAGE_LABEL} - COST BREAKDOWN")
         logger.info("=" * 60)
         logger.info(f"Groups total:          {total_rows}")
         logger.info(f"  diarized:            {self.processed}")
+        logger.info(f"  safety-blocked:      {self.blocked} (UNKNOWN-speaker turn)")
         logger.info(f"  failed:              {self.failed}")
         logger.info(f"Speaker turns written: {self.segments_total}")
         logger.info(f"Input tokens:          {self.total_input_tokens:,}")

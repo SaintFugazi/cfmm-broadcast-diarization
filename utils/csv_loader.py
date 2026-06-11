@@ -43,7 +43,7 @@ class CSVLoader:
             by=['Channel Name', 'Broadcast Date', 'Program Title', 'Broadcast Time'],
             na_position='last'
         )
-        logger.info(f"Sorted by: Channel Name → Broadcast Date → Program Title → Broadcast Time")
+        logger.info(f"Sorted by: Channel Name -> Broadcast Date -> Program Title -> Broadcast Time")
         return df_sorted
 
     @staticmethod

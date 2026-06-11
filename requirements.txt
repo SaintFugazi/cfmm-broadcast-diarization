@@ -13,3 +13,6 @@ torch==2.7.1
 transformers==4.54.1
 sentencepiece==0.2.1    # required by the DeBERTa-v3 tokenizer
 protobuf                # required to build the DeBERTa-v3 fast tokenizer
+
+# Local punctuation fallback used when Gemini's core safety filter blocks a transcript
+deepmultilingualpunctuation==1.0.1

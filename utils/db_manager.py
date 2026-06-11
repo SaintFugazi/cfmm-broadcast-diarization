@@ -44,9 +44,26 @@ class DatabaseManager:
                     channel_name TEXT NOT NULL,
                     plain_text TEXT NOT NULL,
                     program_id TEXT,
-                    status TEXT DEFAULT 'PENDING'
+                    status TEXT DEFAULT 'PENDING',
+                    "count" TEXT
                 )
             """)
+
+            # Migration: older databases predate the "count" column.
+            cursor.execute("PRAGMA table_info(grouped)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "count" not in columns:
+                cursor.execute('ALTER TABLE grouped ADD COLUMN "count" TEXT')
+                conn.commit()
+            # Migration: safety-degradation bookkeeping (NULL = normal row).
+            # block_status records a core-filter safety block at some stage;
+            # punctuation_source records which engine restored punctuation.
+            if "block_status" not in columns:
+                cursor.execute('ALTER TABLE grouped ADD COLUMN block_status TEXT')
+                conn.commit()
+            if "punctuation_source" not in columns:
+                cursor.execute('ALTER TABLE grouped ADD COLUMN punctuation_source TEXT')
+                conn.commit()
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS person_bio (
@@ -71,9 +88,17 @@ class DatabaseManager:
                     speaker TEXT,
                     role TEXT,
                     confidence_score REAL,
-                    verification_score REAL
+                    verification_score REAL,
+                    block_status TEXT
                 )
             """)
+
+            # Migration: older databases predate dialogues.block_status.
+            cursor.execute("PRAGMA table_info(dialogues)")
+            dialogue_columns = {row[1] for row in cursor.fetchall()}
+            if "block_status" not in dialogue_columns:
+                cursor.execute('ALTER TABLE dialogues ADD COLUMN block_status TEXT')
+                conn.commit()
 
     def insert_grouped(self, transcript_data: List[Dict[str, str]]) -> None:
         """Insert grouped data"""
@@ -110,13 +135,58 @@ class DatabaseManager:
             cursor.execute(f"SELECT * FROM {table} WHERE status = ?", (status,))
             return [dict(row) for row in cursor.fetchall()]
 
-    def update_punctuated(self, group_id: str, punctuated_text: str) -> None:
-        """Overwrite plain_text with punctuated text and mark row PUNCTUATED"""
+    def update_punctuated(self, group_id: str, punctuated_text: str, source=None) -> None:
+        """Overwrite plain_text with punctuated text; optionally record which engine
+        produced it (PunctuationSource.LLM / LOCAL / RAW). Status is set by the caller."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if source is None:
+                cursor.execute(
+                    "UPDATE grouped SET plain_text = ? WHERE group_id = ?",
+                    (punctuated_text, group_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE grouped SET plain_text = ?, punctuation_source = ? WHERE group_id = ?",
+                    (punctuated_text, source, group_id)
+                )
+            conn.commit()
+
+    def set_block_status(self, table: str, row_id: str, block_status) -> None:
+        """Set (or clear, with None) the block_status flag for a grouped/dialogues row.
+
+        Records that a stage degraded this row because of a non-configurable core
+        safety block, so reruns can skip it (terminal) and audits can find it.
+        """
+        allowed = {"grouped": "group_id", "dialogues": "dialogue_id"}
+        if table not in allowed:
+            raise ValueError(f"Invalid table for block_status: {table}")
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE grouped SET plain_text = ? WHERE group_id = ?",
-                (punctuated_text, group_id)
+                f"UPDATE {table} SET block_status = ? WHERE {allowed[table]} = ?",
+                (block_status, row_id)
+            )
+            conn.commit()
+
+    def set_dialogues_block_status_by_group(self, group_id: str, block_status) -> None:
+        """Flag every dialogue of a group as blocked (used when verification is safety-blocked
+        so those dialogues are excluded from future low-confidence re-checks)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE dialogues SET block_status = ? WHERE group_id = ?",
+                (block_status, group_id)
+            )
+            conn.commit()
+
+    def update_count(self, group_id: str, label: str) -> None:
+        """Set the transcript-size classification (OVER/UNDER) for one group."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE grouped SET "count" = ? WHERE group_id = ?',
+                (label, group_id)
             )
             conn.commit()
 
@@ -150,8 +220,8 @@ class DatabaseManager:
             for row in rows:
                 try:
                     cursor.execute(
-                        "INSERT INTO dialogues (dialogue_id, group_id, program_id, broadcast_time, dialogue, speaker, role, confidence_score) VALUES (?,?,?,?,?,?,?,?)",
-                        (row['dialogue_id'], row['group_id'], row['program_id'], row['broadcast_time'], row['dialogue'], row.get('speaker'), row.get('role'), row.get('confidence_score'))
+                        "INSERT INTO dialogues (dialogue_id, group_id, program_id, broadcast_time, dialogue, speaker, role, confidence_score, block_status) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (row['dialogue_id'], row['group_id'], row['program_id'], row['broadcast_time'], row['dialogue'], row.get('speaker'), row.get('role'), row.get('confidence_score'), row.get('block_status'))
                     )
                 except sqlite3.IntegrityError:
                     logger.warning(f"Dialogue ID already exists: {row['dialogue_id']}")
@@ -175,6 +245,7 @@ class DatabaseManager:
                 JOIN grouped g ON d.group_id = g.group_id
                 WHERE (d.confidence_score < ? OR d.confidence_score IS NULL)
                   AND d.verification_score IS NULL
+                  AND d.block_status IS NULL
             """, (threshold,))
             return [dict(row) for row in cursor.fetchall()]
 
@@ -205,7 +276,12 @@ class DatabaseManager:
 
         Returns one dict per dialogue with:
         broadcast_date, broadcast_time, program_title, channel_name,
-        dialogue, speaker, role, confidence_score, verification_score — sorted chronologically.
+        dialogue, speaker, role, confidence_score, verification_score, block_status —
+        sorted chronologically.
+
+        Block Status surfaces any safety degradation affecting the row: the dialogue's
+        own flag (e.g. BLOCKED_DIARIZATION) takes precedence, otherwise the group-level
+        flag from an earlier stage (punctuation/relevance/names). NULL for normal rows.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -219,7 +295,8 @@ class DatabaseManager:
                     d.speaker            AS "Speaker",
                     d.role               AS "Role",
                     d.confidence_score   AS "Confidence Score",
-                    d.verification_score AS "Verification Score"
+                    d.verification_score AS "Verification Score",
+                    COALESCE(d.block_status, g.block_status) AS "Block Status"
                 FROM dialogues d
                 JOIN grouped g ON d.group_id = g.group_id
                 ORDER BY g.broadcast_date, d.broadcast_time

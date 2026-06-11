@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import random
 import asyncio
 from collections import defaultdict
 
@@ -9,15 +8,25 @@ from google import genai
 from google.genai import types
 
 from utils.progress import gather_with_progress
+from utils.rate_limit import (
+    AsyncRateLimiter,
+    async_call_with_retry,
+    validate_response,
+    close_async_client,
+    PIPELINE_SAFETY_SETTINGS,
+    SafetyBlockedError,
+)
 
 from utils.logger import get_logger
 from utils.prompt_loader import load_prompt
+from config.constants import BlockStatus
 from config.constants import (
     VERIFICATION_CONCURRENCY,
     VERIFICATION_MAX_RETRIES,
     VERIFICATION_BACKOFF_BASE,
     VERIFICATION_BACKOFF_CAP,
     VERIFICATION_CACHE_TTL,
+    GEMINI_RPM_LIMIT,
     GEMINI_INPUT_COST_PER_1M,
     GEMINI_OUTPUT_COST_PER_1M,
     GEMINI_CACHE_INPUT_DISCOUNT,
@@ -52,6 +61,7 @@ class VerificationAgent:
         self.user_template = prompt["user_prompt"]
 
         self.semaphore = asyncio.Semaphore(VERIFICATION_CONCURRENCY)
+        self.limiter = None  # AsyncRateLimiter, created per run inside the event loop
 
         # Explicit context cache for the (large, fixed) system instruction.
         self.cache_name = None
@@ -63,6 +73,7 @@ class VerificationAgent:
         self.groups = 0         # broadcast minutes verified (one API call each)
         self.processed = 0      # dialogues verified (speaker confirmed or corrected)
         self.corrected = 0      # dialogues whose speaker changed
+        self.blocked = 0        # dialogues safety-blocked → flagged, left unverified
         self.failed = 0         # dialogues that permanently failed
 
         # Per-group response log — flushed to JSONL at the end of verify()
@@ -84,8 +95,10 @@ class VerificationAgent:
             groups[row["group_id"]].append(row)
 
         logger.info(f"Starting verification on {len(rows)} dialogue(s) across "
-                    f"{len(groups)} group(s) (concurrency={VERIFICATION_CONCURRENCY})")
+                    f"{len(groups)} group(s) (concurrency={VERIFICATION_CONCURRENCY}, "
+                    f"rpm={GEMINI_RPM_LIMIT})")
 
+        self.limiter = AsyncRateLimiter(GEMINI_RPM_LIMIT)
         self._setup_cache()
         try:
             asyncio.run(self._run_all(groups))
@@ -139,7 +152,10 @@ class VerificationAgent:
             asyncio.create_task(self._process_group(group_id, group_rows))
             for group_id, group_rows in groups.items()
         ]
-        await gather_with_progress(tasks, desc="Groups", unit="grp")
+        try:
+            await gather_with_progress(tasks, desc="Groups", unit="grp")
+        finally:
+            await close_async_client(self.client, logger)
 
     async def _process_group(self, group_id, group_rows):
         async with self.semaphore:
@@ -186,6 +202,14 @@ class VerificationAgent:
                     "group_id": group_id,
                     "dialogues": dialogues,
                 })
+            except SafetyBlockedError as e:
+                # Core filter rejected this minute's context; verification is impossible.
+                # Flag all of the group's dialogues as blocked so future runs exclude them
+                # from the low-confidence re-check (otherwise they'd be re-sent and re-blocked).
+                self.db.set_dialogues_block_status_by_group(group_id, BlockStatus.VERIFICATION)
+                self.blocked += len(group_rows)
+                logger.warning(f"Verification safety-blocked for group_id={group_id} "
+                               f"({len(group_rows)} dialogue(s)); flagged, left unverified ({e}).")
             except Exception as e:
                 self.failed += len(group_rows)
                 logger.warning(f"Failed to verify group_id={group_id} "
@@ -313,52 +337,43 @@ class VerificationAgent:
             return None
 
     async def _call_llm_with_retry(self, user_prompt):
-        last_exc = None
-        for attempt in range(VERIFICATION_MAX_RETRIES):
-            try:
-                # Reference the cached system instruction when available; otherwise inline it.
-                # (cached_content and system_instruction are mutually exclusive.)
-                if self.cache_name:
-                    config = types.GenerateContentConfig(
-                        cached_content=self.cache_name,
-                        temperature=0,
-                        response_mime_type="application/json",
-                    )
-                else:
-                    config = types.GenerateContentConfig(
-                        system_instruction=self.system_instruction,
-                        temperature=0,
-                        response_mime_type="application/json",
-                    )
-
-                resp = await self.client.aio.models.generate_content(
-                    model=self.model,
-                    contents=user_prompt,
-                    config=config,
+        async def make_call():
+            # Reference the cached system instruction when available; otherwise inline it.
+            # (cached_content and system_instruction are mutually exclusive.)
+            if self.cache_name:
+                config = types.GenerateContentConfig(
+                    cached_content=self.cache_name,
+                    temperature=0,
+                    response_mime_type="application/json",
+                    safety_settings=PIPELINE_SAFETY_SETTINGS,
                 )
-                usage = resp.usage_metadata
-                in_tokens = usage.prompt_token_count or 0
-                out_tokens = usage.candidates_token_count or 0
-                cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
-                return resp.text, in_tokens, out_tokens, cached_tokens
-            except Exception as e:
-                last_exc = e
-                sleep_s = min(VERIFICATION_BACKOFF_BASE ** attempt, VERIFICATION_BACKOFF_CAP)
-                sleep_s += random.uniform(0, 1)  # jitter
-                if self._is_rate_limit(e):
-                    logger.info(f"Rate limit hit (attempt {attempt + 1}); "
-                                f"backing off {sleep_s:.1f}s")
-                else:
-                    logger.info(f"Error (attempt {attempt + 1}): {e}; "
-                                f"retrying in {sleep_s:.1f}s")
-                await asyncio.sleep(sleep_s)
+            else:
+                config = types.GenerateContentConfig(
+                    system_instruction=self.system_instruction,
+                    temperature=0,
+                    response_mime_type="application/json",
+                    safety_settings=PIPELINE_SAFETY_SETTINGS,
+                )
 
-        raise last_exc
+            resp = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=user_prompt,
+                config=config,
+            )
+            text = validate_response(resp)
+            usage = resp.usage_metadata
+            cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
+            return (text, usage.prompt_token_count or 0,
+                    usage.candidates_token_count or 0, cached_tokens)
 
-    @staticmethod
-    def _is_rate_limit(exc) -> bool:
-        msg = str(exc).lower()
-        return "429" in msg or "resource_exhausted" in msg or "rate limit" in msg
+        return await async_call_with_retry(
+            make_call,
+            limiter=self.limiter,
+            logger=logger,
+            backoff_base=VERIFICATION_BACKOFF_BASE,
+            backoff_cap=VERIFICATION_BACKOFF_CAP,
+            transient_max_retries=VERIFICATION_MAX_RETRIES,
+        )
 
     @staticmethod
     def _is_only_vocative(speaker: str, text: str) -> bool:
@@ -456,6 +471,7 @@ class VerificationAgent:
         logger.info(f"  groups (API calls):  {self.groups}")
         logger.info(f"  verified:            {self.processed}")
         logger.info(f"  speaker corrected:   {self.corrected}")
+        logger.info(f"  safety-blocked:      {self.blocked} (left unverified)")
         logger.info(f"  failed:              {self.failed}")
         logger.info(f"Input tokens:          {self.total_input_tokens:,}")
         logger.info(f"  of which cached:     {self.total_cached_tokens:,} (billed @ {GEMINI_CACHE_INPUT_DISCOUNT:.0%})")

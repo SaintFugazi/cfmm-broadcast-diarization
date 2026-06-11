@@ -6,13 +6,16 @@ from .punctuation import PunctuationRestoration
 from .relevance import RelevanceAgent
 from .name_extraction import NameExtractor
 from .diarize import DiarizationAgent
+from .diarize_indexed import IndexedDiarizationAgent
 from .verify import VerificationAgent
+from .count import TokenCounter
 
 from utils.db_manager import DatabaseManager
 from utils.logger import get_logger
 from utils.csv_loader import CSVLoader
 from config.constants import (
     RowStatus,
+    COUNT_OVER,
     GEMINI_INPUT_COST_PER_1M,
     GEMINI_OUTPUT_COST_PER_1M,
     VERIFICATION_CONFIDENCE_THRESHOLD,
@@ -20,7 +23,7 @@ from config.constants import (
 
 logger = get_logger(__name__)
 
-STEPS = ["group", "punctuation", "relevance", "names", "sentences", "classify_bert", "classify_llm", "diarize"]
+STEPS = ["group", "punctuation", "relevance", "names", "diarize", "count"]
 
 class DiarizationPipeline:
     """Main Diarization Orchestration"""
@@ -90,9 +93,28 @@ class DiarizationPipeline:
 
             if self._should_stop("punctuation"):
                 return
+            
+            # Step 4: Token Count
+            print("\n[STEP 4] Transcript Size Classification")
+            df = self.db.get_row_by_status(RowStatus.PUNCTUATED, "grouped")
+            if len(df) > 0:
+                logger.info("Counting tokens for PUNCTUATED rows...")
+                self._count(df)
+            else:
+                logger.info("No PUNCTUATED rows detected from `grouped` table. Proceeding to FAILED rows...")
+            
+            df_failed = self.db.get_row_by_status(RowStatus.FAILED_C, "grouped")
+            if len(df_failed) > 0:
+                logger.info("Counting tokens for FAILED COUNT rows...")
+                self._count(df_failed)
+            else:
+                logger.info("No FAILED COUNT rows detected from `grouped` table. Proceeding...")
+            
+            if self._should_stop("count"):
+                return
 
-            # Step 4: Relevance Filter (news vs. non-news)
-            print("\n[STEP 4] Relevance Filtering")
+            # Step 5: Relevance Filter (news vs. non-news)
+            print("\n[STEP 5] Relevance Filtering")
             df = self.db.get_row_by_status(RowStatus.PUNCTUATED, "grouped")
             if len(df) > 0:
                 logger.info("Filtering PUNCTUATED rows for relevance...")
@@ -110,8 +132,8 @@ class DiarizationPipeline:
             if self._should_stop("relevance"):
                 return
 
-            # Step 5: Name Extraction
-            print("\n[STEP 5] BERT-Driven Name Extraction")
+            # Step 6: Name Extraction
+            print("\n[STEP 6] BERT-Driven Name Extraction")
             df = self.db.get_row_by_status(RowStatus.RELEVANT, "grouped")
             if len(df) > 0:
                 logger.info("Extracting names from RELEVANT rows...")
@@ -129,8 +151,8 @@ class DiarizationPipeline:
             if self._should_stop("names"):
                 return
 
-            # Step 6: Group Diarization
-            print("\n[STEP 6] Diarizing group dialogues")
+            # Step 7: Group Diarization
+            print("\n[STEP 7] Diarizing group dialogues")
             df = self.db.get_row_by_status(RowStatus.NAMED, "grouped")
             if len(df) > 0:
                 logger.info("Diarizing NAMED rows...")
@@ -148,8 +170,8 @@ class DiarizationPipeline:
             if self._should_stop("diarize"):
                 return
 
-            # Step 7: Verification
-            print("\n[STEP 7] Verification/Correction")
+            # Step 8: Verification
+            print("\n[STEP 8] Verification/Correction")
             rows = self.db.get_low_confidence_dialogues(VERIFICATION_CONFIDENCE_THRESHOLD)
             if rows:
                 logger.info(f"Verifying {len(rows)} low-confidence dialogue(s)...")
@@ -186,6 +208,12 @@ class DiarizationPipeline:
         agent.punctuate()
         self._accumulate_costs("punctuation", agent)
 
+    def _count(self, df):
+        """Classifies group as either OVER or UNDER depending on Transcript Size"""
+        agent = TokenCounter(self.db, df)
+        agent.count()
+        self._accumulate_costs("count", agent)
+
     def _filter_relevance(self, df):
         """Flags non-news groups as NOT_RELEVANT so they are excluded from later steps"""
         agent = RelevanceAgent(self.db, df)
@@ -199,10 +227,25 @@ class DiarizationPipeline:
         self._accumulate_costs("names", agent)
 
     def _diarize(self, df):
-        """Diarizes group dialogues"""
-        agent = DiarizationAgent(self.db, df)
-        agent.diarize()
-        self._accumulate_costs("diarization", agent)
+        """Diarizes group dialogues, routed by the Step 4 size classification:
+        UNDER (or unclassified) rows use the standard text-echoing diarizer;
+        OVER rows use the indexed diarizer, whose output does not scale with
+        transcript length."""
+        rows = df if isinstance(df, list) else df.to_dict("records")
+        under = [r for r in rows if r.get("count") != COUNT_OVER]
+        over = [r for r in rows if r.get("count") == COUNT_OVER]
+
+        if under:
+            logger.info(f"Diarizing {len(under)} UNDER group(s) with the standard agent...")
+            agent = DiarizationAgent(self.db, under)
+            agent.diarize()
+            self._accumulate_costs("diarization", agent)
+
+        if over:
+            logger.info(f"Diarizing {len(over)} OVER group(s) with the indexed agent...")
+            agent = IndexedDiarizationAgent(self.db, over)
+            agent.diarize()
+            self._accumulate_costs("diarization_indexed", agent)
     
     def _verify(self, rows):
         """Verifies/corrects low-confidence diarized dialogues"""

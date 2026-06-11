@@ -1,6 +1,5 @@
 import os
 import json
-import random
 import asyncio
 
 from google import genai
@@ -9,7 +8,15 @@ from google.genai import types
 from utils.logger import get_logger
 from utils.prompt_loader import load_prompt
 from utils.progress import gather_with_progress
-from config.constants import RowStatus
+from utils.rate_limit import (
+    AsyncRateLimiter,
+    async_call_with_retry,
+    validate_response,
+    close_async_client,
+    PIPELINE_SAFETY_SETTINGS,
+    SafetyBlockedError,
+)
+from config.constants import RowStatus, BlockStatus
 from config.constants import (
     RELEVANCE_CONCURRENCY,
     RELEVANCE_MAX_RETRIES,
@@ -19,6 +26,7 @@ from config.constants import (
     RELEVANCE_DELETE_THRESHOLD,
     RELEVANCE_CACHE_TTL,
     RELEVANCE_KEYWORDS,
+    GEMINI_RPM_LIMIT,
     GEMINI_INPUT_COST_PER_1M,
     GEMINI_OUTPUT_COST_PER_1M,
     GEMINI_CACHE_INPUT_DISCOUNT,
@@ -63,6 +71,7 @@ class RelevanceAgent:
         self.user_template = prompt["user_prompt"]
 
         self.semaphore = asyncio.Semaphore(RELEVANCE_CONCURRENCY)
+        self.limiter = None  # AsyncRateLimiter, created per run inside the event loop
 
         # Explicit context cache for the (large, fixed) system instruction.
         self.cache_name = None
@@ -74,6 +83,7 @@ class RelevanceAgent:
         self.relevant = 0             # groups marked RELEVANT (news)
         self.not_relevant = 0         # groups marked NOT_RELEVANT (confident non-news)
         self.kept_uncertain = 0       # non-news but low confidence → kept RELEVANT
+        self.blocked = 0              # groups safety-blocked → kept RELEVANT + flagged
         self.failed = 0               # groups marked FAILED_R
 
     # ------------------------------------------------------------------ #
@@ -91,10 +101,11 @@ class RelevanceAgent:
             return
 
         logger.info(f"Relevance filter on {len(rows)} group(s) sent to LLM "
-                    f"(concurrency={RELEVANCE_CONCURRENCY})")
+                    f"(concurrency={RELEVANCE_CONCURRENCY}, rpm={GEMINI_RPM_LIMIT})")
 
         chunks = [rows[i:i + RELEVANCE_CHUNK_SIZE]
                   for i in range(0, len(rows), RELEVANCE_CHUNK_SIZE)]
+        self.limiter = AsyncRateLimiter(GEMINI_RPM_LIMIT)
         self._setup_cache()
         try:
             asyncio.run(self._run_all(chunks))
@@ -145,28 +156,57 @@ class RelevanceAgent:
     # ------------------------------------------------------------------ #
     async def _run_all(self, chunks):
         tasks = [asyncio.create_task(self._process_chunk(chunk)) for chunk in chunks]
-        await gather_with_progress(tasks, desc="Chunks", unit="chk")
+        try:
+            await gather_with_progress(tasks, desc="Chunks", unit="chk")
+        finally:
+            await close_async_client(self.client, logger)
 
     async def _process_chunk(self, chunk):
         async with self.semaphore:
-            indexed = list(enumerate(chunk, start=1))
+            await self._classify(chunk, allow_isolation=True)
+
+    async def _classify(self, chunk, allow_isolation: bool):
+        """Classify a batch of groups in one LLM call.
+
+        On a safety block of a multi-group batch, re-classify each group individually
+        (allow_isolation) so a single offending transcript doesn't force the whole
+        batch to be kept-and-flagged — only the genuinely blocked group(s) are degraded.
+        """
+        indexed = list(enumerate(chunk, start=1))
+        try:
             user_prompt = self.user_template.replace("{entries}", self._build_entries(indexed))
+            text, in_tokens, out_tokens, cached_tokens = await self._call_llm_with_retry(user_prompt)
+            self.total_input_tokens += in_tokens
+            self.total_output_tokens += out_tokens
+            self.total_cached_tokens += cached_tokens
 
-            try:
-                text, in_tokens, out_tokens, cached_tokens = await self._call_llm_with_retry(user_prompt)
-                self.total_input_tokens += in_tokens
-                self.total_output_tokens += out_tokens
-                self.total_cached_tokens += cached_tokens
-
-                verdicts = self._parse_response(text)  # {index: (is_relevant, confidence)}
-                self._apply_verdicts(indexed, verdicts)
-            except Exception as e:
-                # Never mark NOT_RELEVANT on error — flag for retry instead.
-                for _, row in indexed:
-                    self.db.update_status("grouped", row["group_id"], RowStatus.FAILED_R)
-                    self.failed += 1
-                logger.warning(f"Relevance chunk failed permanently "
-                               f"({len(chunk)} group(s)): {e}")
+            verdicts = self._parse_response(text)  # {index: (is_relevant, confidence)}
+            self._apply_verdicts(indexed, verdicts)
+        except SafetyBlockedError as e:
+            if allow_isolation and len(chunk) > 1:
+                logger.info(f"Relevance batch safety-blocked ({len(chunk)} groups); "
+                            f"isolating the offender(s) one group at a time.")
+                for row in chunk:
+                    await self._classify([row], allow_isolation=False)
+                return
+            # Single group (or already isolated) is the genuine offender. Never silently
+            # drop: keep RELEVANT (favor recall — blocked content is often the most
+            # newsworthy) and flag it so it advances terminally instead of retrying.
+            for _, row in indexed:
+                group_id = row["group_id"]
+                self.db.update_status("grouped", group_id, RowStatus.RELEVANT)
+                self.db.set_block_status("grouped", group_id, BlockStatus.RELEVANCE)
+                self.relevant += 1
+                self.blocked += 1
+            logger.warning(f"Relevance safety-blocked for group_id="
+                           f"{indexed[0][1]['group_id']}; kept RELEVANT, flagged ({e}).")
+        except Exception as e:
+            # Never mark NOT_RELEVANT on error — flag for retry instead.
+            for _, row in indexed:
+                self.db.update_status("grouped", row["group_id"], RowStatus.FAILED_R)
+                self.failed += 1
+            logger.warning(f"Relevance chunk failed permanently "
+                           f"({len(chunk)} group(s)): {e}")
 
     def _apply_verdicts(self, indexed, verdicts):
         """Apply the per-group decision rule (LLM relevance → confidence gate)."""
@@ -231,52 +271,43 @@ class RelevanceAgent:
         return verdicts
 
     async def _call_llm_with_retry(self, user_prompt):
-        last_exc = None
-        for attempt in range(RELEVANCE_MAX_RETRIES):
-            try:
-                # Reference the cached system instruction when available; otherwise inline it.
-                # (cached_content and system_instruction are mutually exclusive.)
-                if self.cache_name:
-                    config = types.GenerateContentConfig(
-                        cached_content=self.cache_name,
-                        temperature=0,
-                        response_mime_type="application/json",
-                    )
-                else:
-                    config = types.GenerateContentConfig(
-                        system_instruction=self.system_instruction,
-                        temperature=0,
-                        response_mime_type="application/json",
-                    )
-
-                resp = await self.client.aio.models.generate_content(
-                    model=self.model,
-                    contents=user_prompt,
-                    config=config,
+        async def make_call():
+            # Reference the cached system instruction when available; otherwise inline it.
+            # (cached_content and system_instruction are mutually exclusive.)
+            if self.cache_name:
+                config = types.GenerateContentConfig(
+                    cached_content=self.cache_name,
+                    temperature=0,
+                    response_mime_type="application/json",
+                    safety_settings=PIPELINE_SAFETY_SETTINGS,
                 )
-                usage = resp.usage_metadata
-                in_tokens = usage.prompt_token_count or 0
-                out_tokens = usage.candidates_token_count or 0
-                cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
-                return resp.text, in_tokens, out_tokens, cached_tokens
-            except Exception as e:
-                last_exc = e
-                sleep_s = min(RELEVANCE_BACKOFF_BASE ** attempt, RELEVANCE_BACKOFF_CAP)
-                sleep_s += random.uniform(0, 1)  # jitter
-                if self._is_rate_limit(e):
-                    logger.info(f"Rate limit hit (attempt {attempt + 1}); "
-                                f"backing off {sleep_s:.1f}s")
-                else:
-                    logger.info(f"Error (attempt {attempt + 1}): {e}; "
-                                f"retrying in {sleep_s:.1f}s")
-                await asyncio.sleep(sleep_s)
+            else:
+                config = types.GenerateContentConfig(
+                    system_instruction=self.system_instruction,
+                    temperature=0,
+                    response_mime_type="application/json",
+                    safety_settings=PIPELINE_SAFETY_SETTINGS,
+                )
 
-        raise last_exc
+            resp = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=user_prompt,
+                config=config,
+            )
+            text = validate_response(resp)
+            usage = resp.usage_metadata
+            cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
+            return (text, usage.prompt_token_count or 0,
+                    usage.candidates_token_count or 0, cached_tokens)
 
-    @staticmethod
-    def _is_rate_limit(exc) -> bool:
-        msg = str(exc).lower()
-        return "429" in msg or "resource_exhausted" in msg or "rate limit" in msg
+        return await async_call_with_retry(
+            make_call,
+            limiter=self.limiter,
+            logger=logger,
+            backoff_base=RELEVANCE_BACKOFF_BASE,
+            backoff_cap=RELEVANCE_BACKOFF_CAP,
+            transient_max_retries=RELEVANCE_MAX_RETRIES,
+        )
 
     # ------------------------------------------------------------------ #
     # Reporting
@@ -297,6 +328,7 @@ class RelevanceAgent:
         logger.info(f"Groups total:          {total_rows}")
         logger.info(f"  relevant (kept):     {self.relevant}")
         logger.info(f"    kept (uncertain):  {self.kept_uncertain}")
+        logger.info(f"    kept (blocked):    {self.blocked}")
         logger.info(f"  not relevant:        {self.not_relevant}")
         logger.info(f"  failed:              {self.failed}")
         logger.info(f"Input tokens:          {self.total_input_tokens:,}")

@@ -8,12 +8,52 @@ class RowStatus:
     B_CLASSIFIED = 'B_CLASSIFIED'
     G_CLASSIFIED = 'G_CLASSIFIED'
     DIARIZED = 'DIARIZED'
-    SPLIT = 'SPLIT'
     FAILED_P = 'FAILED PUNCTUATION'
+    FAILED_C = 'FAILED COUNT'
     FAILED_R = 'FAILED RELEVANCE'
     FAILED_N = 'FAILED NAME EXTRACTION'
     FAILED_D = 'FAILED DIARIZATION'
 
+
+class BlockStatus:
+    """grouped.block_status / dialogues.block_status markers.
+
+    A non-NULL block_status records that a stage could NOT use the LLM for this row
+    because Gemini's non-configurable core safety filter (e.g. PROHIBITED_CONTENT)
+    rejected the content. Unlike a FAILED_* status, a blocked row is *terminal*: it
+    advances on its normal forward status (so reruns skip it and never re-incur the
+    deterministic block), with this column flagging it as degraded for audit / requeue.
+    Transient errors (429, timeout) still use FAILED_* and remain retryable.
+    """
+    PUNCTUATION = 'BLOCKED_PUNCTUATION'      # local punctuation fallback was used
+    RELEVANCE = 'BLOCKED_RELEVANCE'          # kept RELEVANT without an LLM verdict
+    NAMES = 'BLOCKED_NAME_EXTRACTION'        # persons kept, role/context left NULL
+    DIARIZATION = 'BLOCKED_DIARIZATION'      # emitted a single UNKNOWN-speaker turn
+    VERIFICATION = 'BLOCKED_VERIFICATION'    # left unverified, excluded from re-check
+
+
+class PunctuationSource:
+    """grouped.punctuation_source: which engine restored a row's punctuation."""
+    LLM = 'llm'        # normal Gemini punctuation
+    LOCAL = 'local'    # local model fallback after a safety block
+    RAW = 'raw'        # neither worked; original unpunctuated text kept
+
+# Local punctuation fallback (used only when the Gemini call is safety-blocked).
+LOCAL_PUNCTUATION_MODEL = "kredor/punctuate-all"   # multilingual; backs deepmultilingualpunctuation
+
+
+# Transcript size classification (token counting) settings.
+# The standard diarizer re-emits the whole transcript in its output, so transcripts whose
+# token count would push the OUTPUT near the model's generation ceiling must go through the
+# indexed diarizer instead (which outputs unit ranges, not text). 3000 input tokens ≈ 3500+
+# output tokens after JSON overhead — comfortably under the ~8k output ceiling, with margin.
+COUNT_OVER = 'OVER'                  # grouped."count" value: too large for the standard diarizer
+COUNT_UNDER = 'UNDER'                # grouped."count" value: safe for the standard diarizer
+DIARIZATION_TOKEN_THRESHOLD = 1000   # plain_text token count above which a group is OVER
+COUNT_CONCURRENCY = 10               # max simultaneous in-flight count_tokens requests
+COUNT_MAX_RETRIES = 5                # retry attempts per row on failure
+COUNT_BACKOFF_BASE = 2               # exponential backoff base (seconds)
+COUNT_BACKOFF_CAP = 60               # max backoff sleep (seconds)
 
 # Punctuation Restoration Agent settings
 PUNCTUATION_CONCURRENCY = 5       # max simultaneous in-flight LLM requests
@@ -53,6 +93,15 @@ RELEVANCE_KEYWORDS = [
     "Ayatollah", "Shaykh", "Fatwa",
     "Mohammedan", "Wahabi", "Wahhabi", "Salafi", "Salafist",
 ]
+
+# Global Gemini rate-limit strategy (shared by ALL agents via utils/rate_limit.py).
+# Tune GEMINI_RPM_LIMIT to your API tier: this is the single lever that paces every agent.
+# 10 is conservative and safe even on the free tier — raise it once you know your quota.
+GEMINI_RPM_LIMIT = 150          # requests/min budget enforced across each agent's concurrent tasks
+RATE_LIMIT_MIN_BACKOFF = 60    # floor (s) for a 429 backoff, so the per-minute quota window resets
+RATE_LIMIT_MAX_RETRIES = 8     # retries reserved specifically for rate-limit (429) errors
+REQUEST_TIMEOUT = 180          # seconds before a single hung LLM call is cancelled and retried
+PUNCTUATION_MAX_CHUNK_CHARS = 8000  # transcripts longer than this are split before punctuating
 
 # Gemini pricing (USD per 1M tokens) — VERIFY against current pricing for your model
 GEMINI_INPUT_COST_PER_1M = 0.25
