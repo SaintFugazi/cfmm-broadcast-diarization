@@ -1,0 +1,95 @@
+day,channel,start,end
+Sunday,BBC1LDN (BBC One London),06:00:00,10:30:00
+Sunday,BBC1LDN (BBC One London),12:00:00,14:00:00
+Sunday,BBC1LDN (BBC One London),16:00:00,19:00:00
+Sunday,BBC1LDN (BBC One London),22:00:00,23:00:00
+Sunday,C4 (Channel 4),18:00:00,19:00:00
+Sunday,CH5 (5),18:00:00,19:00:00
+Sunday,GBNUK (GB News),00:00:00,23:59:00
+Sunday,ITV1LON (ITV),09:25:00,09:30:00
+Sunday,ITV1LON (ITV),12:00:00,14:00:00
+Sunday,ITV1LON (ITV),17:00:00,19:00:00
+Sunday,ITV1LON (ITV),22:00:00,23:00:00
+Sunday,SKYNEWS (Sky News),00:00:00,23:59:00
+Monday,BBC1LDN (BBC One London),06:00:00,10:00:00
+Monday,BBC1LDN (BBC One London),13:00:00,23:30:00
+Monday,C4 (Channel 4),12:05:00,12:10:00
+Monday,C4 (Channel 4),19:00:00,20:00:00
+Monday,CH5 (5),12:30:00,13:00:00
+Monday,CH5 (5),18:30:00,20:10:00
+Monday,GBNUK (GB News),00:00:00,23:59:00
+Monday,ITV1LON (ITV),06:00:00,09:30:00
+Monday,ITV1LON (ITV),10:00:00,10:30:00
+Monday,ITV1LON (ITV),10:00:00,11:00:00
+Monday,ITV1LON (ITV),12:00:00,14:00:00
+Monday,ITV1LON (ITV),17:00:00,19:00:00
+Monday,ITV1LON (ITV),22:00:00,22:30:00
+Monday,SKYNEWS (Sky News),00:00:00,23:59:00
+Tuesday,BBC1LDN (BBC One London),06:00:00,10:00:00
+Tuesday,BBC1LDN (BBC One London),13:00:00,23:30:00
+Tuesday,C4 (Channel 4),12:05:00,12:10:00
+Tuesday,C4 (Channel 4),19:00:00,20:00:00
+Tuesday,CH5 (5),12:30:00,13:00:00
+Tuesday,CH5 (5),18:30:00,20:10:00
+Tuesday,GBNUK (GB News),00:00:00,23:59:00
+Tuesday,ITV1LON (ITV),06:00:00,09:30:00
+Tuesday,ITV1LON (ITV),10:00:00,10:30:00
+Tuesday,ITV1LON (ITV),10:00:00,11:00:00
+Tuesday,ITV1LON (ITV),12:00:00,14:00:00
+Tuesday,ITV1LON (ITV),17:00:00,19:00:00
+Tuesday,ITV1LON (ITV),22:00:00,22:30:00
+Tuesday,SKYNEWS (Sky News),00:00:00,23:59:00
+Wednesday,BBC1LDN (BBC One London),06:00:00,10:00:00
+Wednesday,BBC1LDN (BBC One London),13:00:00,23:30:00
+Wednesday,C4 (Channel 4),12:05:00,12:10:00
+Wednesday,C4 (Channel 4),19:00:00,20:00:00
+Wednesday,CH5 (5),12:30:00,13:00:00
+Wednesday,CH5 (5),18:30:00,20:10:00
+Wednesday,GBNUK (GB News),00:00:00,23:59:00
+Wednesday,ITV1LON (ITV),06:00:00,09:30:00
+Wednesday,ITV1LON (ITV),10:00:00,10:30:00
+Wednesday,ITV1LON (ITV),10:00:00,11:00:00
+Wednesday,ITV1LON (ITV),12:00:00,14:00:00
+Wednesday,ITV1LON (ITV),17:00:00,19:00:00
+Wednesday,ITV1LON (ITV),22:00:00,22:30:00
+Wednesday,SKYNEWS (Sky News),00:00:00,23:59:00
+Thursday,BBC1LDN (BBC One London),06:00:00,10:00:00
+Thursday,BBC1LDN (BBC One London),13:00:00,23:30:00
+Thursday,C4 (Channel 4),12:05:00,12:10:00
+Thursday,C4 (Channel 4),19:00:00,20:00:00
+Thursday,CH5 (5),12:30:00,13:00:00
+Thursday,CH5 (5),18:30:00,20:10:00
+Thursday,GBNUK (GB News),00:00:00,23:59:00
+Thursday,ITV1LON (ITV),06:00:00,09:30:00
+Thursday,ITV1LON (ITV),10:00:00,10:30:00
+Thursday,ITV1LON (ITV),10:00:00,11:00:00
+Thursday,ITV1LON (ITV),12:00:00,14:00:00
+Thursday,ITV1LON (ITV),17:00:00,19:00:00
+Thursday,ITV1LON (ITV),22:00:00,22:30:00
+Thursday,SKYNEWS (Sky News),00:00:00,23:59:00
+Friday,BBC1LDN (BBC One London),06:00:00,10:00:00
+Friday,BBC1LDN (BBC One London),13:00:00,23:30:00
+Friday,C4 (Channel 4),12:05:00,12:10:00
+Friday,C4 (Channel 4),19:00:00,20:00:00
+Friday,CH5 (5),12:30:00,13:00:00
+Friday,CH5 (5),18:30:00,20:10:00
+Friday,GBNUK (GB News),00:00:00,23:59:00
+Friday,ITV1LON (ITV),06:00:00,09:30:00
+Friday,ITV1LON (ITV),10:00:00,10:30:00
+Friday,ITV1LON (ITV),10:00:00,11:00:00
+Friday,ITV1LON (ITV),12:00:00,14:00:00
+Friday,ITV1LON (ITV),17:00:00,19:00:00
+Friday,ITV1LON (ITV),22:00:00,22:30:00
+Friday,SKYNEWS (Sky News),00:00:00,23:59:00
+Saturday,BBC1LDN (BBC One London),06:00:00,10:00:00
+Saturday,BBC1LDN (BBC One London),12:00:00,14:00:00
+Saturday,BBC1LDN (BBC One London),16:00:00,19:00:00
+Saturday,BBC1LDN (BBC One London),22:00:00,23:00:00
+Saturday,C4 (Channel 4),18:00:00,18:30:00
+Saturday,CH5 (5),18:00:00,19:00:00
+Saturday,GBNUK (GB News),00:00:00,23:59:00
+Saturday,ITV1LON (ITV),09:25:00,09:30:00
+Saturday,ITV1LON (ITV),12:00:00,14:00:00
+Saturday,ITV1LON (ITV),18:00:00,20:00:00
+Saturday,ITV1LON (ITV),22:00:00,23:30:00
+Saturday,SKYNEWS (Sky News),00:00:00,23:59:00

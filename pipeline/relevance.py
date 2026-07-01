@@ -40,16 +40,14 @@ PROMPT_PATH = "prompts/relevance_filter_prompt.yaml"
 class RelevanceAgent:
     """Filters non-news groups with an async, cost-aware Gemini agent.
 
-    For each PUNCTUATED group, decides whether its dominant theme SUBSTANTIVELY discusses
-    news/current-affairs content (kept RELEVANT) or merely name-drops a topic keyword inside
-    non-news filler — commercials, promos, passing mentions, entertainment/sport/leisure
-    (marked NOT_RELEVANT and thus excluded from later steps).
+    Runs on raw PENDING groups (before punctuation) so non-news content is dropped
+    before any punctuation spend is incurred. Decides whether each group's dominant theme
+    SUBSTANTIVELY discusses news/current-affairs (kept RELEVANT) or is non-news filler —
+    commercials, promos, passing mentions, entertainment/sport/leisure (marked NOT_RELEVANT).
 
-    Note: the source CSV is already keyword pre-filtered upstream, so virtually every group
-    mentions a keyword. A keyword mention is therefore NOT evidence of relevance, and there is no
-    deterministic keyword shortcut here — EVERY group is judged by the LLM. The keyword list is
-    still passed to the prompt as topical context. Groups are batched (RELEVANCE_CHUNK_SIZE per
-    call) and the fixed system instruction is cached once per run.
+    Punctuation is not required for theme classification — the words themselves are sufficient.
+    Groups are batched (RELEVANCE_CHUNK_SIZE per call) and the fixed system instruction is
+    cached once per run.
 
     A group is only marked NOT_RELEVANT when the model is confident (>= RELEVANCE_DELETE_THRESHOLD);
     uncertain groups are kept (favor recall). Soft delete only — no rows are removed.
@@ -90,11 +88,7 @@ class RelevanceAgent:
     # Entrypoint
     # ------------------------------------------------------------------ #
     def filter(self):
-        """Sync entrypoint: batched LLM classification of every group → log cost breakdown.
-
-        There is no keyword pre-scan: the source is already keyword-filtered, so a keyword mention
-        is not evidence of relevance. Every group is judged by the LLM.
-        """
+        """Sync entrypoint: batched LLM classification of PENDING groups → log cost breakdown."""
         rows = self.df if isinstance(self.df, list) else self.df.to_dict("records")
         if not rows:
             logger.info("No groups to filter for relevance. Skipping.")

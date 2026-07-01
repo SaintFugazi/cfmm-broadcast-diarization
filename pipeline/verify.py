@@ -163,9 +163,7 @@ class VerificationAgent:
             indexed = list(enumerate(group_rows, start=1))
             full_text = group_rows[0].get("plain_text") or ""
 
-            people = self.db.get_person_bio_by_group_id(group_id)
             user_prompt = self.user_template.format(
-                people_data=self._build_people_data(people),
                 full_text=full_text,
                 dialogues=self._build_dialogues_block(indexed),
             )
@@ -260,19 +258,6 @@ class VerificationAgent:
                 # Speaker unchanged → leave the role populated by diarization untouched.
                 self.db.update_dialogue_verification(dialogue_id, speaker, score)
             self.processed += 1
-
-    @staticmethod
-    def _build_people_data(rows) -> str:
-        """Render person_bio rows as a newline list of candidate speakers."""
-        if not rows:
-            return "(no people extracted for this group)"
-        lines = []
-        for r in rows:
-            person = (r.get("person") or "").strip()
-            role = (r.get("role") or "Unknown").strip()
-            context = (r.get("context_of_mention") or "Unknown").strip()
-            lines.append(f"- Person: {person} | Role: {role} | Context: {context}")
-        return "\n".join(lines)
 
     @staticmethod
     def _build_dialogues_block(indexed) -> str:

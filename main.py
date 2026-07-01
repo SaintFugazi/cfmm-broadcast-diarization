@@ -1,5 +1,8 @@
 import argparse
+from dotenv import load_dotenv
 from pipeline.orchestrator import DiarizationPipeline, STEPS
+
+load_dotenv()
 
 if __name__ == "__main__":
 

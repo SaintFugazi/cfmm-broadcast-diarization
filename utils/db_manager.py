@@ -1,6 +1,8 @@
 import sqlite3
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import datetime
+from itertools import groupby
 from typing import List, Dict, Any
 
 from config.constants import *
@@ -64,6 +66,9 @@ class DatabaseManager:
             if "punctuation_source" not in columns:
                 cursor.execute('ALTER TABLE grouped ADD COLUMN punctuation_source TEXT')
                 conn.commit()
+            if "n_segments" in columns:
+                cursor.execute('ALTER TABLE grouped DROP COLUMN n_segments')
+                conn.commit()
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS person_bio (
@@ -78,6 +83,19 @@ class DatabaseManager:
                 )
             """)
 
+            # segments table — Step 6 (segmentation) output: verbatim speaker-change
+            # spans, before any attribution. One row per segment, ordered within a group.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS segments (
+                    segment_id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    program_id TEXT,
+                    broadcast_time TEXT NOT NULL,
+                    order_index INTEGER NOT NULL,
+                    text TEXT NOT NULL
+                )
+            """)
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS dialogues (
                     dialogue_id TEXT PRIMARY KEY,
@@ -89,15 +107,44 @@ class DatabaseManager:
                     role TEXT,
                     confidence_score REAL,
                     verification_score REAL,
-                    block_status TEXT
+                    block_status TEXT,
+                    order_index INTEGER,
+                    speaker_type TEXT,
+                    note TEXT
                 )
             """)
 
-            # Migration: older databases predate dialogues.block_status.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS final (
+                    window_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    program_title    TEXT NOT NULL,
+                    channel_name     TEXT NOT NULL,
+                    broadcast_date   TEXT NOT NULL,
+                    broadcast_time   TEXT NOT NULL,
+                    duration_min     REAL NOT NULL,
+                    n_segments       INTEGER NOT NULL,
+                    speakers         TEXT,
+                    stitched_dialogue  TEXT,
+                    diarized_dialogue  TEXT
+                )
+            """)
+
+            # Migration: older databases predate some dialogues columns.
             cursor.execute("PRAGMA table_info(dialogues)")
             dialogue_columns = {row[1] for row in cursor.fetchall()}
             if "block_status" not in dialogue_columns:
                 cursor.execute('ALTER TABLE dialogues ADD COLUMN block_status TEXT')
+                conn.commit()
+            # Step 7 (attribution) additions: turn order within a group, speaker type
+            # (live/clip/crowd/voiceover/unison), and an editorial/overlap note.
+            if "order_index" not in dialogue_columns:
+                cursor.execute('ALTER TABLE dialogues ADD COLUMN order_index INTEGER')
+                conn.commit()
+            if "speaker_type" not in dialogue_columns:
+                cursor.execute('ALTER TABLE dialogues ADD COLUMN speaker_type TEXT')
+                conn.commit()
+            if "note" not in dialogue_columns:
+                cursor.execute('ALTER TABLE dialogues ADD COLUMN note TEXT')
                 conn.commit()
 
     def insert_grouped(self, transcript_data: List[Dict[str, str]]) -> None:
@@ -114,6 +161,30 @@ class DatabaseManager:
                     logger.warning(f"Group ID already exists: {data['group_id']}")
             conn.commit()
     
+    def insert_segments(self, rows: List[Dict[str, Any]]) -> None:
+        """Insert Step 6 segmentation rows into the `segments` table."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            for row in rows:
+                try:
+                    cursor.execute(
+                        "INSERT INTO segments (segment_id, group_id, program_id, broadcast_time, order_index, text) VALUES (?,?,?,?,?,?)",
+                        (row['segment_id'], row['group_id'], row.get('program_id'), row['broadcast_time'], row['order_index'], row['text'])
+                    )
+                except sqlite3.IntegrityError:
+                    logger.warning(f"Segment ID already exists: {row['segment_id']}")
+            conn.commit()
+
+    def get_segments_by_group_id(self, group_id: str) -> List[Dict]:
+        """Return a group's segments (Step 6 output) ordered by order_index."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM segments WHERE group_id = ? ORDER BY order_index",
+                (group_id,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def insert_person_bio(self, rows: List[Dict[str, Any]]) -> None:
         """Insert person/role/context rows into person_bio"""
         with self.get_connection() as conn:
@@ -133,6 +204,16 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(f"SELECT * FROM {table} WHERE status = ?", (status,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_punctuated_uncounted(self) -> List[Dict]:
+        """Return PUNCTUATED rows whose token count has not yet been classified."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT * FROM grouped WHERE status = ? AND "count" IS NULL',
+                (RowStatus.PUNCTUATED,)
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     def update_punctuated(self, group_id: str, punctuated_text: str, source=None) -> None:
@@ -214,14 +295,14 @@ class DatabaseManager:
             return [dict(row) for row in cursor.fetchall()]
 
     def insert_dialogues(self, rows: List[Dict[str, Any]]) -> None:
-        """Insert diarized speaker turns into the dialogues table."""
+        """Insert attributed speaker turns into the dialogues table."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             for row in rows:
                 try:
                     cursor.execute(
-                        "INSERT INTO dialogues (dialogue_id, group_id, program_id, broadcast_time, dialogue, speaker, role, confidence_score, block_status) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (row['dialogue_id'], row['group_id'], row['program_id'], row['broadcast_time'], row['dialogue'], row.get('speaker'), row.get('role'), row.get('confidence_score'), row.get('block_status'))
+                        "INSERT INTO dialogues (dialogue_id, group_id, program_id, broadcast_time, dialogue, speaker, role, confidence_score, block_status, order_index, speaker_type, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (row['dialogue_id'], row['group_id'], row['program_id'], row['broadcast_time'], row['dialogue'], row.get('speaker'), row.get('role'), row.get('confidence_score'), row.get('block_status'), row.get('order_index'), row.get('speaker_type'), row.get('note'))
                     )
                 except sqlite3.IntegrityError:
                     logger.warning(f"Dialogue ID already exists: {row['dialogue_id']}")
@@ -271,13 +352,48 @@ class DatabaseManager:
                 )
             conn.commit()
 
+    def get_ordered_groups(self) -> List[Dict]:
+        """Return all groups sorted by (broadcast_date, channel_name, broadcast_time)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT group_id, broadcast_date, broadcast_time, channel_name, program_id
+                FROM grouped
+                ORDER BY broadcast_date, channel_name, broadcast_time
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_boundary_dialogue(self, group_id: str, position: str) -> Dict:
+        """Return the first (position='first') or last (position='last') dialogue of a group."""
+        order = "ASC" if position == "first" else "DESC"
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT * FROM dialogues WHERE group_id = ? ORDER BY order_index {order} LIMIT 1",
+                (group_id,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def merge_boundary_dialogues(self, target_id: str, source_id: str, merged_text: str) -> None:
+        """Append source dialogue text into target dialogue, then delete source."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE dialogues SET dialogue = ? WHERE dialogue_id = ?",
+                (merged_text, target_id)
+            )
+            cursor.execute("DELETE FROM dialogues WHERE dialogue_id = ?", (source_id,))
+            conn.commit()
+
     def get_dialogues_export(self) -> List[Dict]:
         """Join dialogues with grouped to produce export-ready rows.
 
         Returns one dict per dialogue with:
         broadcast_date, broadcast_time, program_title, channel_name,
-        dialogue, speaker, role, confidence_score, verification_score, block_status —
-        sorted chronologically.
+        dialogue, speaker, role, speaker_type, note, confidence_score,
+        verification_score, block_status — sorted chronologically, then by turn
+        order within a group (order_index).
 
         Block Status surfaces any safety degradation affecting the row: the dialogue's
         own flag (e.g. BLOCKED_DIARIZATION) takes precedence, otherwise the group-level
@@ -294,12 +410,144 @@ class DatabaseManager:
                     d.dialogue           AS "Dialogue",
                     d.speaker            AS "Speaker",
                     d.role               AS "Role",
+                    d.speaker_type       AS "Speaker Type",
+                    d.note               AS "Note",
                     d.confidence_score   AS "Confidence Score",
                     d.verification_score AS "Verification Score",
                     COALESCE(d.block_status, g.block_status) AS "Block Status"
                 FROM dialogues d
                 JOIN grouped g ON d.group_id = g.group_id
-                ORDER BY g.broadcast_date, d.broadcast_time
+                ORDER BY g.broadcast_date, d.broadcast_time, d.order_index
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def build_final_table(self) -> None:
+        """Populate the `final` table by merging consecutive grouped rows into windows.
+
+        Windows are formed per (broadcast_date, channel_name): consecutive groups whose
+        broadcast_time gap exceeds GROUP_MAX_MINUTES start a new window. Each window
+        becomes one row containing pre-computed stitched and diarized dialogue fields.
+        """
+        with self.get_connection() as conn:
+            conn.execute("DELETE FROM final")
+
+            groups = conn.execute("""
+                SELECT DISTINCT g.group_id, g.broadcast_date, g.channel_name,
+                                g.broadcast_time, g.program_title
+                FROM grouped g
+                INNER JOIN dialogues d ON g.group_id = d.group_id
+                ORDER BY g.broadcast_date, g.channel_name, g.broadcast_time
+            """).fetchall()
+
+            if not groups:
+                logger.info("No groups with dialogues found; final table is empty.")
+                conn.commit()
+                return
+
+            dialogues_by_group = defaultdict(list)
+            for row in conn.execute("""
+                SELECT group_id, speaker, dialogue, order_index
+                FROM dialogues
+                ORDER BY group_id, order_index
+            """):
+                dialogues_by_group[row["group_id"]].append({
+                    "speaker": row["speaker"],
+                    "dialogue": row["dialogue"],
+                    "order_index": row["order_index"],
+                })
+
+            windows = []
+            key_fn = lambda g: (g["broadcast_date"], g["channel_name"])
+            for _, channel_groups in groupby([dict(g) for g in groups], key=key_fn):
+                channel_groups = list(channel_groups)
+                current_window = [channel_groups[0]]
+                for i in range(1, len(channel_groups)):
+                    prev_t = datetime.strptime(channel_groups[i - 1]["broadcast_time"], "%H:%M:%S")
+                    curr_t = datetime.strptime(channel_groups[i]["broadcast_time"], "%H:%M:%S")
+                    gap_min = (curr_t - prev_t).total_seconds() / 60
+                    if gap_min > GROUP_MAX_MINUTES:
+                        windows.append(current_window)
+                        current_window = [channel_groups[i]]
+                    else:
+                        current_window.append(channel_groups[i])
+                windows.append(current_window)
+
+            for window in windows:
+                all_dialogues = []
+                for g in window:
+                    all_dialogues.extend(dialogues_by_group.get(g["group_id"], []))
+                if not all_dialogues:
+                    continue
+
+                program_title = Counter(g["program_title"] for g in window).most_common(1)[0][0]
+                channel_name = window[0]["channel_name"]
+                broadcast_date = window[0]["broadcast_date"]
+                start_time = window[0]["broadcast_time"]
+                end_time = window[-1]["broadcast_time"]
+                broadcast_time = f"{start_time} - {end_time}"
+
+                start_dt = datetime.strptime(start_time, "%H:%M:%S")
+                end_dt = datetime.strptime(end_time, "%H:%M:%S")
+                duration_min = (end_dt - start_dt).total_seconds() / 60
+
+                n_segments = len(all_dialogues)
+
+                seen = set()
+                speakers_ordered = []
+                for d in all_dialogues:
+                    spk = (d["speaker"] or "").strip()
+                    if spk and spk not in seen:
+                        seen.add(spk)
+                        speakers_ordered.append(spk)
+                speakers = ", ".join(speakers_ordered)
+
+                stitched_parts = []
+                for g in window:
+                    group_dlgs = dialogues_by_group.get(g["group_id"], [])
+                    if not group_dlgs:
+                        continue
+                    text = " ".join(d["dialogue"] for d in group_dlgs if d["dialogue"])
+                    stitched_parts.append(f"[{g['broadcast_time']}] {text}")
+                stitched_dialogue = "\n\n".join(stitched_parts)
+
+                diarized_parts = []
+                current_speaker = all_dialogues[0]["speaker"]
+                current_texts = [all_dialogues[0]["dialogue"] or ""]
+                for d in all_dialogues[1:]:
+                    spk = d["speaker"]
+                    if spk == current_speaker:
+                        current_texts.append(d["dialogue"] or "")
+                    else:
+                        diarized_parts.append(
+                            f"**Speaker ( {current_speaker} )** : {' '.join(t for t in current_texts if t)}"
+                        )
+                        current_speaker = spk
+                        current_texts = [d["dialogue"] or ""]
+                diarized_parts.append(
+                    f"**Speaker ( {current_speaker} )** : {' '.join(t for t in current_texts if t)}"
+                )
+                diarized_dialogue = "\n\n".join(diarized_parts)
+
+                conn.execute("""
+                    INSERT INTO final (program_title, channel_name, broadcast_date, broadcast_time,
+                                       duration_min, n_segments, speakers, stitched_dialogue, diarized_dialogue)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (program_title, channel_name, broadcast_date, broadcast_time,
+                      duration_min, n_segments, speakers, stitched_dialogue, diarized_dialogue))
+
+            conn.commit()
+            logger.info(f"Built final table with {len(windows)} window(s).")
+
+    def get_final_export(self) -> List[Dict]:
+        """Return all rows from the final table ordered chronologically."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT window_id, program_title, channel_name, broadcast_date,
+                       broadcast_time, duration_min, n_segments, speakers,
+                       stitched_dialogue, diarized_dialogue
+                FROM final
+                ORDER BY broadcast_date, channel_name, broadcast_time
             """)
             return [dict(row) for row in cursor.fetchall()]
 

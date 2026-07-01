@@ -4,9 +4,8 @@ import pandas as pd
 from .group import GroupTranscript
 from .punctuation import PunctuationRestoration
 from .relevance import RelevanceAgent
-from .name_extraction import NameExtractor
-from .diarize import DiarizationAgent
-from .diarize_indexed import IndexedDiarizationAgent
+from .segmentation import SegmentationAgent, IndexedSegmentationAgent
+from .attribution import AttributionAgent
 from .verify import VerificationAgent
 from .count import TokenCounter
 
@@ -23,7 +22,7 @@ from config.constants import (
 
 logger = get_logger(__name__)
 
-STEPS = ["group", "punctuation", "relevance", "names", "diarize", "count"]
+STEPS = ["group", "relevance", "punctuation", "count", "segmentation", "attribution"]
 
 class DiarizationPipeline:
     """Main Diarization Orchestration"""
@@ -75,52 +74,15 @@ class DiarizationPipeline:
             if self._should_stop("group"):
                 return
 
-            # Step 3: Punctuation
-            print("\n[STEP 3] Punctuation Restoration")
+            # Step 3: Relevance Filter (news vs. non-news) — runs on raw PENDING rows
+            # so non-news content is dropped before punctuation is paid for.
+            print("\n[STEP 3] Relevance Filtering")
             df = self.db.get_row_by_status(RowStatus.PENDING, "grouped")
             if len(df) > 0:
-                logger.info("Punctuating PENDING rows...")
-                self._punctuate(df)
-            else:
-                logger.info("No PENDING rows detected from 'grouped' table. Proceeding to FAILED rows...")
-
-            df_failed = self.db.get_row_by_status(RowStatus.FAILED_P, "grouped")
-            if len(df_failed) > 0:
-                logger.info("Puntuating FAILED rows...")
-                self._punctuate(df_failed)
-            else:
-                logger.info("No FAILED PUNCTUATION rows detected from 'grouped table. Proceeding...")
-
-            if self._should_stop("punctuation"):
-                return
-            
-            # Step 4: Token Count
-            print("\n[STEP 4] Transcript Size Classification")
-            df = self.db.get_row_by_status(RowStatus.PUNCTUATED, "grouped")
-            if len(df) > 0:
-                logger.info("Counting tokens for PUNCTUATED rows...")
-                self._count(df)
-            else:
-                logger.info("No PUNCTUATED rows detected from `grouped` table. Proceeding to FAILED rows...")
-            
-            df_failed = self.db.get_row_by_status(RowStatus.FAILED_C, "grouped")
-            if len(df_failed) > 0:
-                logger.info("Counting tokens for FAILED COUNT rows...")
-                self._count(df_failed)
-            else:
-                logger.info("No FAILED COUNT rows detected from `grouped` table. Proceeding...")
-            
-            if self._should_stop("count"):
-                return
-
-            # Step 5: Relevance Filter (news vs. non-news)
-            print("\n[STEP 5] Relevance Filtering")
-            df = self.db.get_row_by_status(RowStatus.PUNCTUATED, "grouped")
-            if len(df) > 0:
-                logger.info("Filtering PUNCTUATED rows for relevance...")
+                logger.info("Filtering PENDING rows for relevance...")
                 self._filter_relevance(df)
             else:
-                logger.info("No PUNCTUATED rows detected from 'grouped' table. Proceeding to FAILED rows...")
+                logger.info("No PENDING rows detected from 'grouped' table. Proceeding to FAILED rows...")
 
             df_failed = self.db.get_row_by_status(RowStatus.FAILED_R, "grouped")
             if len(df_failed) > 0:
@@ -132,42 +94,80 @@ class DiarizationPipeline:
             if self._should_stop("relevance"):
                 return
 
-            # Step 6: Name Extraction
-            print("\n[STEP 6] BERT-Driven Name Extraction")
+            # Step 4: Punctuation — only RELEVANT rows, non-news already excluded
+            print("\n[STEP 4] Punctuation Restoration")
             df = self.db.get_row_by_status(RowStatus.RELEVANT, "grouped")
             if len(df) > 0:
-                logger.info("Extracting names from RELEVANT rows...")
-                self._name_extract(df)
+                logger.info("Punctuating RELEVANT rows...")
+                self._punctuate(df)
             else:
                 logger.info("No RELEVANT rows detected from 'grouped' table. Proceeding to FAILED rows...")
 
-            df_failed = self.db.get_row_by_status(RowStatus.FAILED_N, "grouped")
+            df_failed = self.db.get_row_by_status(RowStatus.FAILED_P, "grouped")
             if len(df_failed) > 0:
-                logger.info("Extracting names for FAILED rows...")
-                self._name_extract(df_failed)
+                logger.info("Punctuating FAILED PUNCTUATION rows...")
+                self._punctuate(df_failed)
             else:
-                logger.info("No FAILED NAME EXTRACTION rows detected from 'grouped' table. Proceeding...")
+                logger.info("No FAILED PUNCTUATION rows detected from 'grouped' table. Proceeding...")
 
-            if self._should_stop("names"):
+            if self._should_stop("punctuation"):
                 return
 
-            # Step 7: Group Diarization
-            print("\n[STEP 7] Diarizing group dialogues")
-            df = self.db.get_row_by_status(RowStatus.NAMED, "grouped")
+            # Step 5: Token Count
+            print("\n[STEP 5] Transcript Size Classification")
+            df = self.db.get_punctuated_uncounted()
             if len(df) > 0:
-                logger.info("Diarizing NAMED rows...")
-                self._diarize(df)
+                logger.info(f"Counting tokens for {len(df)} uncounted PUNCTUATED rows...")
+                self._count(df)
             else:
-                logger.info("No NAMED rows detected from `grouped` table. Proceeding to FAILED rows...")
-            
-            df_failed = self.db.get_row_by_status(RowStatus.FAILED_D, "grouped")
-            if len(df_failed) > 0:
-                logger.info("Diarizing FAILED DIARIZATION rows...")
-                self._diarize(df_failed)
-            else:
-                logger.info("No FAILED DIARIZATION rows detected from `grouped` table. Proceeding...")
+                logger.info("No uncounted PUNCTUATED rows detected from `grouped` table. Proceeding to FAILED rows...")
 
-            if self._should_stop("diarize"):
+            df_failed = self.db.get_row_by_status(RowStatus.FAILED_C, "grouped")
+            if len(df_failed) > 0:
+                logger.info("Counting tokens for FAILED COUNT rows...")
+                self._count(df_failed)
+            else:
+                logger.info("No FAILED COUNT rows detected from `grouped` table. Proceeding...")
+
+            if self._should_stop("count"):
+                return
+
+            # Step 6: Segmentation (split each group at speaker changes; no attribution)
+            print("\n[STEP 6] Segmentation")
+            df = self.db.get_row_by_status(RowStatus.PUNCTUATED, "grouped")
+            if len(df) > 0:
+                logger.info("Segmenting PUNCTUATED rows...")
+                self._segment(df)
+            else:
+                logger.info("No PUNCTUATED rows detected from `grouped` table. Proceeding to FAILED rows...")
+
+            df_failed = self.db.get_row_by_status(RowStatus.FAILED_S, "grouped")
+            if len(df_failed) > 0:
+                logger.info("Segmenting FAILED SEGMENTATION rows...")
+                self._segment(df_failed)
+            else:
+                logger.info("No FAILED SEGMENTATION rows detected from `grouped` table. Proceeding...")
+
+            if self._should_stop("segmentation"):
+                return
+
+            # Step 7: Attribution (assign speaker/role, clean text, score confidence)
+            print("\n[STEP 7] Speaker Attribution")
+            df = self.db.get_row_by_status(RowStatus.SEGMENTED, "grouped")
+            if len(df) > 0:
+                logger.info("Attributing SEGMENTED rows...")
+                self._attribute(df)
+            else:
+                logger.info("No SEGMENTED rows detected from `grouped` table. Proceeding to FAILED rows...")
+
+            df_failed = self.db.get_row_by_status(RowStatus.FAILED_A, "grouped")
+            if len(df_failed) > 0:
+                logger.info("Attributing FAILED ATTRIBUTION rows...")
+                self._attribute(df_failed)
+            else:
+                logger.info("No FAILED ATTRIBUTION rows detected from `grouped` table. Proceeding...")
+
+            if self._should_stop("attribution"):
                 return
 
             # Step 8: Verification
@@ -179,8 +179,12 @@ class DiarizationPipeline:
             else:
                 logger.info("No low-confidence dialogues to verify. Skipping.")
 
-            # Step 8: Export
-            print("\n[STEP 8] Exporting dialogues to Excel")
+            # Step 9: Boundary Stitching
+            print("\n[STEP 9] Cross-Group Boundary Stitching")
+            self._stitch_boundaries()
+
+            # Step 10: Export
+            print("\n[STEP 10] Exporting dialogues to Excel")
             self._export()
 
             # Pipeline cost summary
@@ -220,32 +224,32 @@ class DiarizationPipeline:
         agent.filter()
         self._accumulate_costs("relevance", agent)
 
-    def _name_extract(self, df):
-        """Extracts names per row"""
-        agent = NameExtractor(self.db, df)
-        agent.extract()
-        self._accumulate_costs("names", agent)
-
-    def _diarize(self, df):
-        """Diarizes group dialogues, routed by the Step 4 size classification:
-        UNDER (or unclassified) rows use the standard text-echoing diarizer;
-        OVER rows use the indexed diarizer, whose output does not scale with
-        transcript length."""
+    def _segment(self, df):
+        """Splits each group into speaker-change segments (no attribution), routed by the
+        Step 5 size classification: UNDER (or unclassified) rows use the standard
+        text-echoing segmenter; OVER rows use the indexed segmenter, whose output does not
+        scale with transcript length."""
         rows = df if isinstance(df, list) else df.to_dict("records")
         under = [r for r in rows if r.get("count") != COUNT_OVER]
         over = [r for r in rows if r.get("count") == COUNT_OVER]
 
         if under:
-            logger.info(f"Diarizing {len(under)} UNDER group(s) with the standard agent...")
-            agent = DiarizationAgent(self.db, under)
-            agent.diarize()
-            self._accumulate_costs("diarization", agent)
+            logger.info(f"Segmenting {len(under)} UNDER group(s) with the standard agent...")
+            agent = SegmentationAgent(self.db, under)
+            agent.segment()
+            self._accumulate_costs("segmentation", agent)
 
         if over:
-            logger.info(f"Diarizing {len(over)} OVER group(s) with the indexed agent...")
-            agent = IndexedDiarizationAgent(self.db, over)
-            agent.diarize()
-            self._accumulate_costs("diarization_indexed", agent)
+            logger.info(f"Segmenting {len(over)} OVER group(s) with the indexed agent...")
+            agent = IndexedSegmentationAgent(self.db, over)
+            agent.segment()
+            self._accumulate_costs("segmentation_indexed", agent)
+
+    def _attribute(self, df):
+        """Attributes each group's segments to speakers, cleans text, scores confidence."""
+        agent = AttributionAgent(self.db, df)
+        agent.attribute()
+        self._accumulate_costs("attribution", agent)
     
     def _verify(self, rows):
         """Verifies/corrects low-confidence diarized dialogues"""
@@ -253,11 +257,61 @@ class DiarizationPipeline:
         agent.verify()
         self._accumulate_costs("verification", agent)
 
+    def _stitch_boundaries(self):
+        """Merge dialogues that straddle consecutive group boundaries when the speaker is the same.
+
+        Iterates groups in chronological order per (channel, date). For each pair of adjacent
+        groups, if the last dialogue of group N and the first dialogue of group N+1 share the
+        same speaker (and neither is UNKNOWN), the latter is appended to the former and deleted.
+        """
+        from itertools import groupby
+
+        groups = self.db.get_ordered_groups()
+        merged = 0
+
+        key = lambda g: (g["broadcast_date"], g["channel_name"])
+        for _, channel_groups in groupby(groups, key=key):
+            channel_groups = list(channel_groups)
+            for i in range(len(channel_groups) - 1):
+                group_a = channel_groups[i]
+                group_b = channel_groups[i + 1]
+
+                last_of_a = self.db.get_boundary_dialogue(group_a["group_id"], "last")
+                first_of_b = self.db.get_boundary_dialogue(group_b["group_id"], "first")
+
+                if not last_of_a or not first_of_b:
+                    continue
+
+                speaker_a = (last_of_a.get("speaker") or "").strip()
+                speaker_b = (first_of_b.get("speaker") or "").strip()
+
+                if not speaker_a or not speaker_b:
+                    continue
+                if speaker_a.upper() == "UNKNOWN" or speaker_b.upper() == "UNKNOWN":
+                    continue
+                if speaker_a.lower() != speaker_b.lower():
+                    continue
+
+                merged_text = last_of_a["dialogue"].rstrip() + " " + first_of_b["dialogue"].lstrip()
+                self.db.merge_boundary_dialogues(
+                    last_of_a["dialogue_id"],
+                    first_of_b["dialogue_id"],
+                    merged_text,
+                )
+                merged += 1
+                logger.info(
+                    f"Boundary stitched: [{group_a['broadcast_time']}] -> [{group_b['broadcast_time']}] "
+                    f"speaker='{speaker_a}'"
+                )
+
+        logger.info(f"Boundary stitching complete: {merged} merge(s) applied.")
+
     def _export(self):
-        """Export the dialogues table joined with grouped metadata to Excel."""
-        rows = self.db.get_dialogues_export()
+        """Build the windowed final table and export it to Excel."""
+        self.db.build_final_table()
+        rows = self.db.get_final_export()
         if not rows:
-            logger.info("No dialogues to export. Skipping.")
+            logger.info("No windows to export. Skipping.")
             return
 
         os.makedirs("data/output", exist_ok=True)
@@ -266,7 +320,7 @@ class DiarizationPipeline:
 
         df = pd.DataFrame(rows)
         df.to_excel(out_path, index=False)
-        logger.info(f"Exported {len(df)} dialogue rows to {out_path}")
+        logger.info(f"Exported {len(df)} window(s) to {out_path}")
         print(f"  Saved: {out_path}")
 
     def _log_pipeline_cost_summary(self):

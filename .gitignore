@@ -64,3 +64,6 @@ archive/
 # Package manager
 pip-log.txt
 pip-delete-this-directory.txt
+
+export.txt
+summary.txt

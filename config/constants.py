@@ -1,18 +1,28 @@
+# Maximum number of consecutive 1-minute clips merged into a single group.
+# Caps group length so transcripts sent to the LLM never span impractically long broadcasts.
+GROUP_MAX_MINUTES = 5
+
 class RowStatus:
     """URL processing status constants"""
     PENDING = 'PENDING'
     PUNCTUATED = 'PUNCTUATED'
     RELEVANT = 'RELEVANT'
     NOT_RELEVANT = 'NOT RELEVANT'
-    NAMED = 'NAMED'
+    SEGMENTED = 'SEGMENTED'
+    ATTRIBUTED = 'ATTRIBUTED'
     B_CLASSIFIED = 'B_CLASSIFIED'
     G_CLASSIFIED = 'G_CLASSIFIED'
-    DIARIZED = 'DIARIZED'
     FAILED_P = 'FAILED PUNCTUATION'
     FAILED_C = 'FAILED COUNT'
     FAILED_R = 'FAILED RELEVANCE'
-    FAILED_N = 'FAILED NAME EXTRACTION'
-    FAILED_D = 'FAILED DIARIZATION'
+    FAILED_S = 'FAILED SEGMENTATION'
+    FAILED_A = 'FAILED ATTRIBUTION'
+
+    # --- Retired (kept for back-compat with older databases) ---
+    NAMED = 'NAMED'                       # was: name-extraction stage (removed)
+    DIARIZED = 'DIARIZED'                 # was: monolithic diarization (split into SEGMENTED+ATTRIBUTED)
+    FAILED_N = 'FAILED NAME EXTRACTION'   # was: name-extraction failure
+    FAILED_D = 'FAILED DIARIZATION'       # was: diarization failure
 
 
 class BlockStatus:
@@ -27,9 +37,13 @@ class BlockStatus:
     """
     PUNCTUATION = 'BLOCKED_PUNCTUATION'      # local punctuation fallback was used
     RELEVANCE = 'BLOCKED_RELEVANCE'          # kept RELEVANT without an LLM verdict
-    NAMES = 'BLOCKED_NAME_EXTRACTION'        # persons kept, role/context left NULL
-    DIARIZATION = 'BLOCKED_DIARIZATION'      # emitted a single UNKNOWN-speaker turn
+    SEGMENTATION = 'BLOCKED_SEGMENTATION'    # one segment spanning the whole text
+    ATTRIBUTION = 'BLOCKED_ATTRIBUTION'      # emitted a single UNKNOWN-speaker turn
     VERIFICATION = 'BLOCKED_VERIFICATION'    # left unverified, excluded from re-check
+
+    # --- Retired (kept for back-compat) ---
+    NAMES = 'BLOCKED_NAME_EXTRACTION'        # was: name-extraction safety block
+    DIARIZATION = 'BLOCKED_DIARIZATION'      # was: monolithic diarization safety block
 
 
 class PunctuationSource:
@@ -140,6 +154,24 @@ DIARIZATION_CONCURRENCY = 5            # max simultaneous in-flight LLM requests
 DIARIZATION_MAX_RETRIES = 5            # retry attempts per group on failure
 DIARIZATION_BACKOFF_BASE = 2           # exponential backoff base (seconds)
 DIARIZATION_BACKOFF_CAP = 60           # max backoff sleep (seconds)
+
+# Step 6 — Segmentation (split a group into speaker-change segments; no attribution).
+# UNDER groups echo verbatim spans; OVER groups return unit-index ranges (indexed agent).
+SEGMENTATION_CONCURRENCY = 5           # max simultaneous in-flight LLM requests
+SEGMENTATION_MAX_RETRIES = 5           # retry attempts per group on failure
+SEGMENTATION_BACKOFF_BASE = 2          # exponential backoff base (seconds)
+SEGMENTATION_BACKOFF_CAP = 60          # max backoff sleep (seconds)
+SEGMENTATION_CACHE_TTL = "1800s"       # context-cache lifetime spanning the segmentation run
+
+# Step 7 — Attribution (assign speaker/role, clean text, per-turn confidence).
+ATTRIBUTION_CONCURRENCY = 5            # max simultaneous in-flight LLM requests
+ATTRIBUTION_MAX_RETRIES = 5            # retry attempts per group on failure
+ATTRIBUTION_BACKOFF_BASE = 2           # exponential backoff base (seconds)
+ATTRIBUTION_BACKOFF_CAP = 60           # max backoff sleep (seconds)
+ATTRIBUTION_CACHE_TTL = "1800s"        # context-cache lifetime spanning the attribution run
+# OVER groups: attribute at most this many segments per LLM call so the cleaned-text
+# output stays under the model's generation ceiling. Turns are concatenated across chunks.
+ATTRIBUTION_OVER_CHUNK_SEGMENTS = 40
 
 # Speaker verification (low-confidence dialogue re-check) settings
 VERIFICATION_CONFIDENCE_THRESHOLD = 0.9   # dialogues below this (or NULL) get verified

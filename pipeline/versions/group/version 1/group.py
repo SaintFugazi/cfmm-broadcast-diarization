@@ -3,8 +3,6 @@ import pandas as pd
 from datetime import timedelta
 
 from utils.logger import get_logger
-from utils.csv_loader import NEWS_SCHEDULE_PATH
-from config.constants import GROUP_MAX_MINUTES
 
 logger = get_logger(__name__)
 
@@ -14,31 +12,30 @@ class GroupTranscript:
     def __init__(self, db_manager, df: pd.DataFrame):
         self.db = db_manager
         self.df = df
-        self.schedule = self._load_news_schedule(NEWS_SCHEDULE_PATH)
 
     def group(self) -> pd.DataFrame:
         df = self.df.copy()
 
         df = df.sort_values(
-            by=['Channel Name', 'Broadcast Date', 'Broadcast Time']
+            by=['Channel Name', 'Program Title', 'Broadcast Date', 'Broadcast Time']
         ).reset_index(drop=True)
 
         grouped_rows = []
 
-        for (channel, date), group_df in df.groupby(
-            ['Channel Name', 'Broadcast Date'], sort=False
+        for (channel, program, date), group_df in df.groupby(
+            ['Channel Name', 'Program Title', 'Broadcast Date'], sort=False
         ):
             group_df = group_df.reset_index(drop=True)
             consolidated = self._consolidate_consecutive(group_df)
-            day_name = pd.Timestamp(date).day_name()
+            program_id = self._generate_program_id(str(date), program, channel)
 
             for row in consolidated:
-                window = self._find_window(day_name, channel, row['Broadcast Time'])
                 row['group_id'] = self._generate_group_id(
-                    str(date), channel, str(row['Broadcast Time']), row['Plain Text']
+                    str(date), program, channel, str(row['Broadcast Time']), row['Plain Text']
                 )
-                row['program_id'] = self._generate_program_id(str(date), channel, window)
+                row['program_id'] = program_id
                 row['Channel Name'] = channel
+                row['Program Title'] = program
                 row['Broadcast Date'] = date
                 grouped_rows.append(row)
 
@@ -68,10 +65,7 @@ class GroupTranscript:
             prev_time = self._to_datetime(current_rows[-1]['Broadcast Time'])
             curr_time = self._to_datetime(group_df.iloc[i]['Broadcast Time'])
 
-            gap_ok = curr_time - prev_time <= timedelta(minutes=1)
-            size_ok = len(current_rows) < GROUP_MAX_MINUTES
-
-            if gap_ok and size_ok:
+            if curr_time - prev_time <= timedelta(minutes=1):
                 current_rows.append(group_df.iloc[i])
             else:
                 consolidated.append(self._merge_rows(current_rows))
@@ -81,38 +75,14 @@ class GroupTranscript:
         return consolidated
 
     @staticmethod
-    def _load_news_schedule(path: str) -> dict:
-        sched_df = pd.read_csv(path)
-        schedule = {}
-        for _, row in sched_df.iterrows():
-            key = (row['day'], row['channel'])
-            start = pd.to_datetime(row['start']).time()
-            end = pd.to_datetime(row['end']).time()
-            schedule.setdefault(key, []).append((start, end))
-        return schedule
-
-    def _find_window(self, day_name: str, channel: str, broadcast_time) -> tuple | None:
-        """Return the (start, end) news window the broadcast_time falls into, or None."""
-        key = (day_name, channel)
-        for start, end in self.schedule.get(key, []):
-            if start <= broadcast_time <= end:
-                return (start, end)
-        return None
-
-    @staticmethod
-    def _generate_program_id(broadcast_date: str, channel_name: str,
-                              window: tuple | None) -> str:
-        if window is not None:
-            start, end = window
-            key = f"{broadcast_date}|{channel_name}|{start}|{end}"
-        else:
-            key = f"{broadcast_date}|{channel_name}"
+    def _generate_program_id(broadcast_date: str, program_title: str, channel_name: str) -> str:
+        key = f"{broadcast_date}|{program_title}|{channel_name}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
     @staticmethod
-    def _generate_group_id(broadcast_date: str, channel_name: str,
+    def _generate_group_id(broadcast_date: str, program_title: str, channel_name: str,
                            broadcast_time: str, plain_text: str) -> str:
-        key = f"{broadcast_date}|{channel_name}|{broadcast_time}|{plain_text}"
+        key = f"{broadcast_date}|{program_title}|{channel_name}|{broadcast_time}|{plain_text}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
     @staticmethod
@@ -121,7 +91,6 @@ class GroupTranscript:
         plain_text = ' '.join(str(r['Plain Text']) for r in rows if pd.notna(r['Plain Text']))
         return {
             'Broadcast Time': first['Broadcast Time'],
-            'Program Title': first['Program Title'],
             'Plain Text': plain_text
         }
 
