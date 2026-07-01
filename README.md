@@ -86,7 +86,7 @@ Create a `.env` file in the project root:
 
 ```env
 GOOGLE_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-2.0-flash-lite
+GEMINI_MODEL=gemini-3.1-flash-lite
 ```
 
 ### 4. Add your input data
