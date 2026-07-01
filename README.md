@@ -2,9 +2,9 @@
 
 ## Description
 
-This pipeline processes raw broadcast transcript exports from Critical Mention and produces a structured, speaker-attributed dialogue dataset in Excel format. Given that Critical Mention transcripts are unpunctuated, unstructured, and lack speaker labels, the pipeline cleans, filters, and diarizes them using a combination of local ML models (BERT/DeBERTa) and Gemini LLM agents.
+This pipeline processes raw broadcast transcript exports from Critical Mention and produces a structured, speaker-attributed dialogue dataset in Excel format. Given that Critical Mention transcripts are unpunctuated, unstructured, and lack speaker labels, the pipeline cleans, filters, segments, and diarizes them using a combination of local ML models and Gemini LLM agents.
 
-The output is a row-per-dialogue Excel file where each line of speech is attributed to a named speaker, enriched with metadata (program, channel, date, speaker role).
+The output is a windowed Excel file where each row represents a contiguous broadcast window — consecutive transcript groups merged within a configurable time threshold — enriched with stitched dialogue and a speaker-labelled diarized version.
 
 ---
 
@@ -14,14 +14,16 @@ The pipeline executes the following steps in order:
 
 | Step | Name | Description |
 |------|------|-------------|
-| 1 | **Ingest** | Loads the Critical Mention CSV export |
-| 2 | **Group** | Consolidates consecutive transcript fragments (within 1 minute) from the same program and channel into unified dialogue blocks |
-| 3 | **Punctuation Restoration** | Uses a Gemini LLM to restore punctuation and casing to raw unpunctuated transcripts |
-| 4 | **Relevance Filtering** | Uses a Gemini LLM to discard non-news content (ads, weather, sport, etc.), keeping only groups relevant to the research focus (Islam/Muslim discourse) |
-| 5 | **Name Extraction** | Runs a two-stage process: a local BERT NER model (`dslim/bert-base-NER`) identifies person mentions, then a Gemini LLM assigns each person a role and context-of-mention |
-| 6 | **Diarization** | Uses a Gemini LLM to attribute each sentence in the dialogue to a named speaker, producing a structured dialogue with confidence scores |
-| 7 | **Verification** | Re-checks diarized dialogues where confidence fell below the threshold, using a Gemini LLM to correct uncertain attributions |
-| 8 | **Export** | Writes the final speaker-attributed dialogue table to an `.xlsx` file in `data/output/` |
+| 1 | **Ingest** | Loads the Critical Mention CSV export and filters rows to known news broadcast windows |
+| 2 | **Group** | Consolidates consecutive 1-minute transcript fragments from the same channel and date into unified blocks (up to `GROUP_MAX_MINUTES`) |
+| 3 | **Relevance Filtering** | Uses a Gemini LLM to discard non-news content (ads, weather, sport, etc.), keeping only groups relevant to the research focus |
+| 4 | **Punctuation Restoration** | Uses a Gemini LLM to restore punctuation and casing to raw unpunctuated transcripts; falls back to a local model on safety blocks |
+| 5 | **Token Count** | Classifies each group as `OVER` or `UNDER` a token threshold; `OVER` groups are routed to an indexed variant of the segmenter and attributor |
+| 6 | **Segmentation** | Uses a Gemini LLM to split each group at speaker-change boundaries, producing ordered verbatim segments with no attribution yet |
+| 7 | **Attribution** | Uses a Gemini LLM to assign each segment a speaker name, role, speaker type, confidence score, and a cleaned dialogue text |
+| 8 | **Verification** | Re-checks attributions below the confidence threshold using a Gemini LLM; corrects speaker and role where needed |
+| 9 | **Boundary Stitching** | Merges the last dialogue of one group with the first of the next when the speaker is the same, eliminating artificial cross-group splits |
+| 10 | **Export** | Merges consecutive groups into broadcast windows, builds the `final` table, and writes it to Excel |
 
 Progress is persisted to a local SQLite database after each step, so interrupted runs resume where they left off rather than restarting from scratch.
 
@@ -37,21 +39,23 @@ cfmm-broadcast-diarization/
 ├── pipeline/
 │   ├── orchestrator.py         # Coordinates all steps end-to-end
 │   ├── group.py                # Step 2: transcript grouping logic
-│   ├── punctuation.py          # Step 3: punctuation restoration agent
-│   ├── relevance.py            # Step 4: relevance filtering agent
-│   ├── name_extraction.py      # Step 5: NER + who/why Gemini agent
-│   ├── diarize.py              # Step 6: speaker diarization agent
-│   └── verify.py               # Step 7: low-confidence verification agent
+│   ├── punctuation.py          # Step 4: punctuation restoration agent
+│   ├── relevance.py            # Step 3: relevance filtering agent
+│   ├── count.py                # Step 5: transcript size classification
+│   ├── segmentation.py         # Step 6: speaker-change segmentation agent
+│   ├── attribution.py          # Step 7: speaker attribution agent
+│   └── verify.py               # Step 8: low-confidence verification agent
 │
 ├── utils/
-│   ├── db_manager.py           # SQLite persistence layer
-│   ├── csv_loader.py           # Critical Mention CSV ingestion
+│   ├── db_manager.py           # SQLite persistence layer (including final table builder)
+│   ├── csv_loader.py           # Critical Mention CSV ingestion and news-window filtering
 │   ├── prompt_loader.py        # Loads YAML prompt templates
 │   ├── progress.py             # Async progress bar utility
 │   └── logger.py               # Coloured console + file logger
 │
 ├── config/
-│   └── constants.py            # All tunable settings (concurrency, costs, model paths, etc.)
+│   ├── constants.py            # All tunable settings (concurrency, costs, thresholds, etc.)
+│   └── news_sched.csv          # News broadcast schedule used to filter input rows
 │
 ├── prompts/                    # YAML prompt templates for each Gemini agent
 ├── model/                      # DeBERTa checkpoint (not tracked in git)
@@ -69,7 +73,6 @@ cfmm-broadcast-diarization/
 
 - Python 3.11 or higher
 - A Google Gemini API key
-- DeBERTa model checkpoint file (not included in the repo, must be obtained separately)
 
 ### 2. Install dependencies
 
@@ -86,19 +89,13 @@ GOOGLE_API_KEY=your_gemini_api_key_here
 GEMINI_MODEL=gemini-2.0-flash-lite
 ```
 
-### 4. Add the DeBERTa model checkpoint
+### 4. Add your input data
 
-Place the trained checkpoint at:
+Place your Critical Mention CSV export into the `data/input/` folder. The CSV must contain these columns:
 
 ```
-model/best_deberta_checkpoint.pt
+Broadcast Date, Broadcast Time, Program Title, Channel Name, Plain Text
 ```
-
-This file is not tracked in git and must be obtained separately.
-
-### 5. Add your input data
-
-Place your Critical Mention CSV export into the `data/input/` folder.
 
 ---
 
@@ -120,7 +117,7 @@ The `--filename` argument should be the name of your CSV file **without** the `.
 ### `--test` step options
 
 ```
-group | punctuation | relevance | names | diarize
+group | relevance | punctuation | count | segmentation | attribution
 ```
 
 **Example — run only through the relevance filter on 50 rows:**
@@ -133,7 +130,20 @@ python main.py --filename "my_export" --limit 50 --test relevance
 
 ## Output
 
-A `.xlsx` file is written to `data/output/` with one row per attributed dialogue line, including speaker name, role, program, channel, broadcast date, and confidence score.
+A `.xlsx` file is written to `data/output/` with one row per broadcast window. A window is formed by merging consecutive grouped transcript blocks whose broadcast times are within `GROUP_MAX_MINUTES` of each other.
+
+| Column | Description |
+|--------|-------------|
+| `window_id` | Auto-incremented unique identifier for the window |
+| `program_title` | Most frequent program title among all groups in the window |
+| `channel_name` | Broadcast channel |
+| `broadcast_date` | Date of the broadcast |
+| `broadcast_time` | Time range of the window (`HH:MM:SS - HH:MM:SS`) |
+| `duration_min` | Duration of the window in minutes |
+| `n_segments` | Total number of attributed dialogue turns in the window |
+| `speakers` | Unique speakers in order of first appearance, comma-separated |
+| `stitched_dialogue` | Full dialogue text, grouped by transcript block with timestamps |
+| `diarized_dialogue` | Speaker-labelled dialogue; consecutive turns from the same speaker are merged under one heading |
 
 If `--limit` was used, the output filename will include the limit value (e.g. `my_export_limit_50_dialogues.xlsx`) so test runs do not overwrite full runs.
 
@@ -143,4 +153,5 @@ If `--limit` was used, the output filename will include the limit value (e.g. `m
 
 - The pipeline is resumable. If a run is interrupted, re-running with the same `--filename` will pick up from where it left off using the SQLite database.
 - LLM cost is tracked per stage and printed in full at the end of each run. See `config/constants.py` to update pricing if Gemini rates change.
-- All configurable settings (concurrency, batch sizes, confidence thresholds, relevance keywords) are centralised in `config/constants.py`.
+- All configurable settings (concurrency, batch sizes, confidence thresholds, relevance keywords, window size) are centralised in `config/constants.py`.
+- `GROUP_MAX_MINUTES` controls both how many 1-minute clips are merged into a single group (Step 2) and the maximum gap allowed when merging groups into export windows (Step 10).
